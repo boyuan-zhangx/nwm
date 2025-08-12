@@ -288,9 +288,8 @@ def main(args):
                 model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
                 loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
                 loss = loss_dict["loss"].mean()
-
+            opt.zero_grad()
             if not bfloat_enable:
-                opt.zero_grad()
                 loss.backward()
                 opt.step()
             else:
