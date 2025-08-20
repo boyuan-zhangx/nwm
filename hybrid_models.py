@@ -108,8 +108,19 @@ class ZeroParameterAdaptiveScoring:
 
 class MemoryBuffer:
     """
-    Smart memory cache system based on scoring mechanism for storing and retrieving key frames
-    Supports dynamic scoring adjustment and multi-factor comprehensive evaluation
+    Intelligent Memory Buffer System - LT-NWM Core Innovation
+    
+    Multi-factor Scored Storage based on:
+    • Turning behavior (35%) - primary behavioral indicator
+    • Spatial uniqueness (30%) - spatial distribution optimization
+    • Maneuver complexity (15%) - complex scenario prioritization
+    
+    Dynamic Decay Mechanism:
+    • Time-based decay for automatic low-value memory phase-out
+    • Usage-based score boosting for frequently accessed memories
+    
+    Adaptive Weight Adjustment:
+    • Dynamically adjusts retrieval weights based on scene complexity
     """
     def __init__(self, max_size: int = 40):
         # === Configurable scoring parameters (Stage 1: simplified scoring based on turns and space) ===
@@ -613,7 +624,14 @@ class MemoryBuffer:
 
 class SelectiveMemoryAttention(nn.Module):
     """
-    Selective memory attention module that can be optionally activated
+    Selective Memory Attention Module - LT-NWM Core Innovation
+    
+    Implements dual-filter mechanism:
+    - Retrieval from memory buffer 
+    - Relevance-based attention threshold (> 10) to filter noise
+    
+    Multi-head attention processing of 8 key historical frames
+    Only activated in relevant scenes (score > 30) to avoid noise
     """
     def __init__(self, hidden_size: int, num_heads: int = 16):
         super().__init__()
@@ -629,15 +647,22 @@ class SelectiveMemoryAttention(nn.Module):
         
         # Gating mechanism for optional activation
         self.activation_gate = nn.Parameter(torch.zeros(1))
-        self.relevance_threshold = 0.1
+        self.relevance_threshold = 10.0  # Dual-filter mechanism: relevance-based attention threshold (> 10)
         
     def compute_relevance(self, query: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-        """Compute relevance scores between query and memory"""
-        # Simplified relevance: cosine similarity
+        """
+        Compute relevance scores between query and memory
+        Part of dual-filter mechanism for noise filtering
+        """
+        # Enhanced relevance calculation: cosine similarity scaled to meaningful range
         query_norm = torch.nn.functional.normalize(query, dim=-1)
         memory_norm = torch.nn.functional.normalize(memory, dim=-1)
-        relevance = torch.sum(query_norm.unsqueeze(1) * memory_norm, dim=-1)
-        return relevance
+        
+        # Cosine similarity returns [-1, 1], scale to [0, 100] for threshold compatibility
+        cosine_sim = torch.sum(query_norm.unsqueeze(1) * memory_norm, dim=-1)
+        relevance_score = (cosine_sim + 1.0) * 50.0  # Scale from [-1,1] to [0,100]
+        
+        return relevance_score
     
     def forward(self, x: torch.Tensor, memory_frames: Optional[torch.Tensor] = None, 
                 activate_memory: bool = True) -> torch.Tensor:
@@ -658,11 +683,12 @@ class SelectiveMemoryAttention(nn.Module):
         # Reshape memory for attention
         memory_flat = memory_frames.view(B, M * N, D)
         
-        # Compute relevance and filter irrelevant memory
+        # Dual-filter mechanism: compute relevance and filter noise
         relevance = self.compute_relevance(x.mean(dim=1, keepdim=True), memory_flat.mean(dim=1, keepdim=True))
         
+        # Relevance-based attention threshold (> 10) to filter noise
         if relevance.max() < self.relevance_threshold:
-            return x * 0  # Skip memory if not relevant enough
+            return x * 0  # Skip memory if not relevant enough (dual-filter mechanism)
         
         # Multi-head attention computation
         q = self.to_q(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
@@ -684,9 +710,14 @@ class SelectiveMemoryAttention(nn.Module):
 
 class HybridCDiTBlock(nn.Module):
     """
-    Hybrid CDiT block that combines:
-    1. CDiT's self-attention and cross-attention for precise conditional control
-    2. Selective memory attention for long-term consistency
+    Hybrid Three-Layer Attention Architecture - LT-NWM Core Innovation
+    
+    The standard CDiT attention is augmented with selective memory attention:
+    1. Self-Attention (standard CDiT layer)
+    2. Cross-Attention (4 frames - CDiT core strength) 
+    3. Selective Memory Attention (8 key historical frames - WorldMem enhancement)
+    
+    Combines CDiT's precise conditional control with long-term memory consistency
     """
     def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0, 
                  enable_memory: bool = True, **block_kwargs):
@@ -760,8 +791,8 @@ class HybridCDiTBlock(nn.Module):
         
         # 3. Selective memory attention (WorldMem enhancement)
         if self.enable_memory and memory_frames is not None:
-            # Adaptive memory activation based on relevance score
-            activate_memory = memory_activation_score > 0.3  # Threshold for activation
+            # Adaptive memory activation based on relevance score - only activated in relevant scenes (score > 30)
+            activate_memory = memory_activation_score > 30.0  # Adaptive activation threshold for relevant scenes
             
             memory_output = self.memory_attn(
                 modulate(self.memory_norm(x), shift_mem, scale_mem),
