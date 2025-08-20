@@ -89,7 +89,7 @@ def init_distributed(port=37124, rank_and_world_size=(None, None)):
 
     torch.cuda.set_device(gpu)
 
-    torch.distributed.init_process_group(
+    dist.init_process_group(
         backend='nccl',
         world_size=world_size,
         rank=rank,
@@ -275,10 +275,11 @@ def sync_fid_loss_fns(fid_loss_fn, device="cuda"):
     }
 
     for serialized_fid_loss_fn in gathered_fid_loss_fn:
-        curr_fid_loss_fn = pickle.loads(serialized_fid_loss_fn)
-        for sec in [1, 2, 4, 8, 16]:
-            sec_fid_loss_fn = curr_fid_loss_fn[sec]
-            final_fid_loss_fn[sec].merge_state([sec_fid_loss_fn])
+        if serialized_fid_loss_fn is not None:
+            curr_fid_loss_fn = pickle.loads(serialized_fid_loss_fn)
+            for sec in [1, 2, 4, 8, 16]:
+                sec_fid_loss_fn = curr_fid_loss_fn[sec]
+                final_fid_loss_fn[sec].merge_state([sec_fid_loss_fn])
     
     return final_fid_loss_fn
 
