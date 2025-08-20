@@ -11,7 +11,9 @@ import torch.nn as nn
 import numpy as np
 import math
 from typing import Optional, Union, List
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.layers.patch_embed import PatchEmbed
+from timm.layers.attention import Attention
+from timm.layers.mlp import Mlp
 from models import TimestepEmbedder, ActionEmbedder, modulate, FinalLayer
 
 
@@ -177,7 +179,7 @@ class MemoryBuffer:
         self.unused_steps = []     # Consecutive unused steps (key metric for dynamic decay)
         self.current_frame_idx = 0 # Current frame index for decay calculations
         
-    def add_frame(self, frame_latent: torch.Tensor, pose: torch.Tensor, action: torch.Tensor = None, frame_idx: int = 0):
+    def add_frame(self, frame_latent: torch.Tensor, pose: torch.Tensor, action: Optional[torch.Tensor] = None, frame_idx: int = 0):
         """Intelligently add frame to memory cache, always retain the highest-scored 40 frames"""
         # Calculate new frame's storage value score
         storage_score = self.compute_storage_score(pose, action, frame_idx)
@@ -218,7 +220,7 @@ class MemoryBuffer:
         
         return False
     
-    def compute_storage_score(self, pose: torch.Tensor, action: torch.Tensor = None, frame_idx: int = 0) -> float:
+    def compute_storage_score(self, pose: torch.Tensor, action: Optional[torch.Tensor] = None, frame_idx: int = 0) -> float:
         """
         Calculate frame storage value score (Stage 1: simplified scoring based on turns and space)
         Focus: turning behavior detection + spatial uniqueness
@@ -276,7 +278,7 @@ class MemoryBuffer:
         final_score = min(max(score, 0.0), config['max_score'])
         return final_score
     
-    def compute_retrieval_score(self, current_pose: torch.Tensor, target_action: torch.Tensor = None) -> torch.Tensor:
+    def compute_retrieval_score(self, current_pose: torch.Tensor, target_action: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Calculate retrieval relevance scores to determine which memories are most helpful for current inference
         Stage 2 optimization: use zero-parameter adaptive weight system
@@ -421,7 +423,7 @@ class MemoryBuffer:
                 #       f"new_score={self.scores[i]:.2f}")
     
     
-    def should_store_frame(self, pose: torch.Tensor, action: torch.Tensor = None, 
+    def should_store_frame(self, pose: torch.Tensor, action: Optional[torch.Tensor] = None, 
                           frame_idx: int = 0, min_distance: float = 5.0) -> bool:
         """
         Determine whether current frame should be stored in memory buffer
@@ -430,7 +432,7 @@ class MemoryBuffer:
         # Always return True, let add_frame method handle replacement logic
         return True
     
-    def get_relevant_frames(self, current_pose: torch.Tensor, target_action: torch.Tensor = None, k: int = 8) -> Optional[torch.Tensor]:
+    def get_relevant_frames(self, current_pose: torch.Tensor, target_action: Optional[torch.Tensor] = None, k: int = 8) -> Optional[torch.Tensor]:
         """
         Get most relevant frames based on flexible retrieval criteria
         Focus: behavioral similarity -> utility -> experience value
@@ -528,7 +530,8 @@ class MemoryBuffer:
         direction_match = (target_direction == memory_directions).float()
         
         # Type matching
-        class_match = (target_class == memory_classes).float()
+        target_class_tensor = torch.tensor(target_class, device=memory_yaw.device)
+        class_match = (target_class_tensor == memory_classes).float()
         
         # Angle difference
         yaw_diff = torch.abs(target_yaw - memory_yaw)
@@ -569,7 +572,7 @@ class MemoryBuffer:
             "scoring_config": self.SCORING_CONFIG
         }
     
-    def get_adaptive_scoring_stats(self, current_pose: torch.Tensor, target_action: torch.Tensor = None) -> dict:
+    def get_adaptive_scoring_stats(self, current_pose: torch.Tensor, target_action: Optional[torch.Tensor] = None) -> dict:
         """
         Get adaptive scoring system statistics
         """
@@ -740,7 +743,7 @@ class HybridCDiTBlock(nn.Module):
         # MLP
         self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        approx_gelu = nn.GELU
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         
         # AdaLN modulation (extended for memory)
@@ -887,7 +890,8 @@ class HybridCDiT(nn.Module):
         # Initialize patch embedding
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        if self.x_embedder.proj.bias is not None:
+            nn.init.constant_(self.x_embedder.proj.bias, 0)
         
         # Initialize embedders
         for embedder in [self.y_embedder.x_emb, self.y_embedder.y_emb, self.y_embedder.angle_emb, 
@@ -906,7 +910,7 @@ class HybridCDiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
     
-    def update_memory(self, frame_latent: torch.Tensor, pose: torch.Tensor, action: torch.Tensor = None):
+    def update_memory(self, frame_latent: torch.Tensor, pose: torch.Tensor, action: Optional[torch.Tensor] = None):
         """Intelligently update memory cache, deciding storage based on scoring system"""
         if self.memory_buffer is not None:
             # Use intelligent storage mechanism
@@ -950,7 +954,7 @@ class HybridCDiT(nn.Module):
 
         x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        imgs = x.reshape(shape=(x.shape[0], c, int(h * p), int(w * p)))
         return imgs
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor, 
