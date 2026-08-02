@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import importlib.util
+from importlib import metadata
 import json
 import os
 from pathlib import Path
@@ -48,6 +49,12 @@ PROFILES = {
         "cv2",
         "pandas",
     ),
+}
+
+NWM_VERSION_PINS = {
+    "accelerate": "0.34.2",
+    "diffusers": "0.30.3",
+    "transformers": "4.44.2",
 }
 
 
@@ -107,6 +114,19 @@ def package_checks(profile: str) -> list[Check]:
     for module in PROFILES[profile]:
         found = importlib.util.find_spec(module) is not None
         checks.append(check(f"module:{module}", found, "available" if found else "missing"))
+    if profile == "nwm":
+        for package, expected in NWM_VERSION_PINS.items():
+            try:
+                installed = metadata.version(package)
+            except metadata.PackageNotFoundError:
+                installed = None
+            checks.append(
+                check(
+                    f"version:{package}",
+                    installed == expected,
+                    f"installed={installed!r}; required={expected}",
+                )
+            )
     return checks
 
 
@@ -217,6 +237,35 @@ def config_checks(config_path: Path, paths_path: Optional[Path] = None) -> list[
             )
         )
 
+    if bool(config.get("phase_a_frozen")):
+        phase_a_model = isinstance(model, str) and model in {
+            "CDiT-S/2",
+            "CDiT-B/2",
+            "CDiT-L/2",
+            "CDiT-XL/2",
+        }
+        context_size = config.get("context_size")
+        train_flag = config.get("train")
+        checks.extend(
+            [
+                check(
+                    "config:phase-a-model",
+                    phase_a_model and not hybrid_flag,
+                    f"model={model!r}; Phase A requires a standard CDiT checkpoint",
+                ),
+                check(
+                    "config:phase-a-context",
+                    context_size == 4,
+                    f"context_size={context_size!r}; context replacement requires 4",
+                ),
+                check(
+                    "config:phase-a-frozen",
+                    train_flag is False,
+                    f"train={train_flag!r}; Phase A configs must set train: false",
+                ),
+            ]
+        )
+
     datasets = config.get("datasets")
     if isinstance(datasets, dict):
         for dataset_name, dataset in datasets.items():
@@ -305,7 +354,16 @@ def doctor(args: argparse.Namespace) -> int:
 
 
 def smoke(_: argparse.Namespace) -> int:
-    command = [sys.executable, "-m", "pytest", "-q", "tests/test_hybrid_models.py"]
+    command = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_hybrid_models.py",
+        "tests/test_retrieval_context.py",
+        "tests/test_revisit_manifest.py",
+        "tests/test_phase_a_eval.py",
+    ]
     print("Running:", " ".join(command), flush=True)
     return subprocess.run(command, cwd=REPO_ROOT, check=False).returncode
 

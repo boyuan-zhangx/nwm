@@ -18,6 +18,7 @@ import pickle
 import tqdm
 from torch.utils.data import Dataset
 from misc import angle_difference, get_data_path, get_delta_np, normalize_data, to_local_coords
+from retrieval_context import load_revisit_manifest, select_context_indices
 
 class BaseDataset(Dataset):
     def __init__(
@@ -78,6 +79,9 @@ class BaseDataset(Dataset):
         """
         Generates a list of tuples of (obs_traj_name, goal_traj_name, obs_time, goal_time) for each observation in the dataset
         """
+        if isinstance(predefined_index, (list, tuple)):
+            self.index_to_data = list(predefined_index)
+            return
         if predefined_index:
             print(f"****** Using a predefined evaluation index... {predefined_index}******")
             with open(predefined_index, "rb") as f:
@@ -257,6 +261,182 @@ class EvalDataset(BaseDataset):
         except Exception as e:
             print(f"Exception in {self.dataset_name}", e)
             raise Exception(e)
+
+
+class RevisitEvalDataset(EvalDataset):
+    """Manifest-driven evaluation dataset with fixed four-slot context policies."""
+
+    def __init__(
+        self,
+        data_folder: str,
+        data_split_folder: str,
+        dataset_name: str,
+        image_size: Tuple[int, int],
+        min_dist_cat: int,
+        max_dist_cat: int,
+        len_traj_pred: int,
+        traj_stride: int,
+        context_size: int,
+        transform: object,
+        manifest_path: str,
+        context_policy: str,
+        selection_seed: int,
+        position_scale: float = 0.75,
+        heading_scale_radians: float = np.deg2rad(20.0),
+        max_queries: int = 0,
+        traj_names: str = "traj_names.txt",
+        normalize: bool = True,
+        goals_per_obs: int = 1,
+    ):
+        if context_size != 4:
+            raise ValueError(
+                f"Phase A context replacement requires context_size=4, got {context_size}"
+            )
+        manifest = load_revisit_manifest(manifest_path)
+        names_path = os.path.join(data_split_folder, traj_names)
+        with open(names_path, "r", encoding="utf-8") as stream:
+            allowed_trajectories = {line.strip() for line in stream if line.strip()}
+
+        records = []
+        selections = []
+        diagnostics = []
+        index_rows = []
+        trajectory_cache = {}
+
+        for record in manifest:
+            trajectory = record["trajectory"]
+            if trajectory not in allowed_trajectories:
+                continue
+            if trajectory not in trajectory_cache:
+                trajectory_path = os.path.join(data_folder, trajectory, "traj_data.pkl")
+                with open(trajectory_path, "rb") as stream:
+                    metadata = pickle.load(stream)
+                if not isinstance(metadata, dict) or not {"position", "yaw"} <= metadata.keys():
+                    raise ValueError(
+                        f"{trajectory_path}: expected position and yaw trajectory metadata"
+                    )
+                trajectory_cache[trajectory] = (
+                    np.asarray(metadata["position"], dtype=np.float64),
+                    np.asarray(metadata["yaw"], dtype=np.float64).squeeze(),
+                )
+
+            positions, yaws = trajectory_cache[trajectory]
+            query_index = int(record["query_index"])
+            if query_index + len_traj_pred >= len(positions):
+                raise ValueError(
+                    f"{trajectory}:{query_index} has fewer than {len_traj_pred} future frames; "
+                    "rebuild the manifest or reduce the requested evaluation horizon"
+                )
+            selection = select_context_indices(
+                policy=context_policy,
+                trajectory=trajectory,
+                query_index=query_index,
+                context_size=context_size,
+                seed=selection_seed,
+                positive_indices=record.get("positive_indices", ()),
+                positions=positions,
+                yaws=yaws,
+                min_temporal_gap=int(record.get("min_temporal_gap", context_size)),
+                position_scale=position_scale,
+                heading_scale_radians=heading_scale_radians,
+            )
+            diagnostic = {
+                "manifest_index": len(records),
+                "trajectory": trajectory,
+                "query_index": query_index,
+                "ground_truth_future_index": query_index + len_traj_pred,
+                "ground_truth_indices": list(
+                    range(query_index + 1, query_index + len_traj_pred + 1)
+                ),
+                "label_source": record.get("label_source", "unknown"),
+                "selection_seed": selection_seed,
+                **selection.to_dict(),
+                "selected_source_path": get_data_path(
+                    data_folder, trajectory, selection.selected_source_index
+                ),
+                "ground_truth_future_path": get_data_path(
+                    data_folder, trajectory, query_index + len_traj_pred
+                ),
+            }
+            records.append(record)
+            selections.append(selection)
+            diagnostics.append(diagnostic)
+            index_rows.append((trajectory, query_index, 0, len_traj_pred))
+            if max_queries > 0 and len(records) >= max_queries:
+                break
+
+        if not records:
+            raise ValueError(
+                f"{manifest_path}: no records belong to trajectories in {names_path}"
+            )
+
+        self.manifest_path = str(manifest_path)
+        self.context_policy = context_policy
+        self.selection_seed = selection_seed
+        self._manifest_records = records
+        self._context_selections = selections
+        self._diagnostics = diagnostics
+
+        super().__init__(
+            data_folder=data_folder,
+            data_split_folder=data_split_folder,
+            dataset_name=dataset_name,
+            image_size=image_size,
+            min_dist_cat=min_dist_cat,
+            max_dist_cat=max_dist_cat,
+            len_traj_pred=len_traj_pred,
+            traj_stride=traj_stride,
+            context_size=context_size,
+            transform=transform,
+            traj_names=traj_names,
+            normalize=normalize,
+            predefined_index=index_rows,
+            goals_per_obs=goals_per_obs,
+        )
+
+    def get_diagnostic(self, index: int):
+        return dict(self._diagnostics[index])
+
+    def __getitem__(self, i: int) -> Tuple[torch.Tensor]:
+        try:
+            trajectory, query_index, _, _ = self.index_to_data[i]
+            selection = self._context_selections[i]
+            pred_times = list(
+                range(query_index + 1, query_index + self.len_traj_pred + 1)
+            )
+            obs_image = torch.stack(
+                [
+                    self.transform(
+                        Image.open(get_data_path(self.data_folder, trajectory, frame_index))
+                    )
+                    for frame_index in selection.context_indices
+                ]
+            )
+            pred_image = torch.stack(
+                [
+                    self.transform(
+                        Image.open(get_data_path(self.data_folder, trajectory, frame_index))
+                    )
+                    for frame_index in pred_times
+                ]
+            )
+
+            trajectory_data = self._get_trajectory(trajectory)
+            actions, _ = self._compute_actions(
+                trajectory_data, query_index, np.array([query_index + 1])
+            )
+            actions[:, :2] = normalize_data(actions[:, :2], self.ACTION_STATS)
+            delta = get_delta_np(actions)
+
+            return (
+                torch.tensor([i], dtype=torch.float32),
+                torch.as_tensor(obs_image, dtype=torch.float32),
+                torch.as_tensor(pred_image, dtype=torch.float32),
+                torch.as_tensor(delta, dtype=torch.float32),
+            )
+        except Exception as error:
+            print(f"Exception in revisit dataset {self.dataset_name}", error)
+            raise
         
 class TrajectoryEvalDataset(BaseDataset):
     def __init__(

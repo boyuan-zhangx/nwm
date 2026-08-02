@@ -79,8 +79,14 @@ python scripts/build_revisit_manifest.py \
   --position-threshold 0.75 \
   --heading-threshold-deg 20 \
   --heading-wrong-threshold-deg 90 \
+  --required-future-steps 4 \
   --seed 0
 ```
+
+Four future steps match the first one-second gate at the default 4 Hz input
+rate. Use `--required-future-steps 64` before a full 16-second or rollout
+evaluation. The inference dataset rejects queries that do not contain the
+requested future horizon rather than silently shortening them.
 
 `geometry_v1` provides pose/heading positives and geometric negatives only. For
 paper examples, freeze landmark and scenario annotations before viewing model

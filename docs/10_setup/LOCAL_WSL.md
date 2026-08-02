@@ -65,6 +65,11 @@ python scripts/navware.py smoke
 python -m pytest -q
 ```
 
+The NWM profile pins `accelerate`, `diffusers`, and `transformers` to the
+versions validated with PyTorch 2.4.1. If doctor reports a version failure,
+rerun `bash setup_nwm_env.sh --profile nwm --backend cu124`; do not silence the
+check or upgrade only one Hugging Face package.
+
 Use `--backend cpu` only on a machine without a visible NVIDIA GPU. On a GPU
 machine, run `nvidia-smi` first and select one of the backends supported by the
 setup script. The locally installed CUDA toolkit version does not select the

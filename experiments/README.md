@@ -20,6 +20,11 @@ The existing `e04_memory_causal_ablation.yaml` belongs to the older hybrid
 study. It remains a specification for possible Phase B work and must not be run
 or cited as the current experiment.
 
+Phase A is currently selected through the tested `--context-policy`,
+`--context-seed`, `--diffusion-seed`, and `--revisit-manifest` CLI values. Save
+the exact command with every run until a YAML experiment runner consumes an
+equivalent specification.
+
 Rules:
 
 - the same seeds, frozen checkpoint, sampler steps, and query manifest apply to

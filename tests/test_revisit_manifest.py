@@ -31,6 +31,8 @@ def test_trajectory_revisits_labels_return_to_start():
     return_record = next(record for record in records if record["query_index"] == 4)
     assert return_record["positive_indices"] == [0]
     assert return_record["query_action"] == [0.0, 0.1, 0.0]
+    assert return_record["ground_truth_future_index"] == 5
+    assert return_record["min_temporal_gap"] == 3
 
 
 def test_cli_writes_deterministic_jsonl(tmp_path):
@@ -66,6 +68,8 @@ def test_cli_writes_deterministic_jsonl(tmp_path):
             "3",
             "--position-threshold",
             "0.2",
+            "--required-future-steps",
+            "1",
         ],
         check=False,
         capture_output=True,

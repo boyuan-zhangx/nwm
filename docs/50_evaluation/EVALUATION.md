@@ -44,6 +44,29 @@ Use at least three seeds for paper results. Preserve and report every seed
 before reporting mean and standard deviation. Do not discard a run because its
 result is unfavorable.
 
+## Copy-paste gate evaluation
+
+For the directory layout produced by the inference handbook:
+
+```bash
+export RUN_OUTPUT=/path/to/results/cdit_s_gate_001
+export GT_DIR="$RUN_OUTPUT/gt/phase_a/recon/time"
+export POLICY_ROOT="$RUN_OUTPUT/nwm_cdit_s/phase_a"
+
+python scripts/evaluate_phase_a.py \
+  --gt-dir "$GT_DIR" \
+  --run "recent=$POLICY_ROOT/recent/context_seed_0/diffusion_seed_0/recon/time" \
+  --run "random_history=$POLICY_ROOT/random_history/context_seed_0/diffusion_seed_0/recon/time" \
+  --run "oracle_manifest=$POLICY_ROOT/oracle_manifest/context_seed_0/diffusion_seed_0/recon/time" \
+  --metrics ssim,lpips,dreamsim \
+  --output "$RUN_OUTPUT/nwm_cdit_s/phase_a/gate_seed_0_metrics.json"
+```
+
+The evaluator requires an exact one-to-one set of relative PNG paths and fails
+on missing or extra predictions. It writes aggregate JSON and per-image JSONL.
+Use `--metrics ssim` for a fast offline pipeline check; LPIPS and DreamSim load
+their pretrained metric weights.
+
 ## Minimum main table
 
 | Policy | LPIPS lower | DreamSim lower | SSIM higher | Top-1 valid higher | Failure rate lower |

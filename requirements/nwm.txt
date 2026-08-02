@@ -1,11 +1,13 @@
 # NWM runtime dependencies. PyTorch is installed separately by setup_nwm_env.sh
 # so CPU/CUDA wheel selection remains explicit.
-accelerate>=0.34,<2
+# Keep the Hugging Face stack aligned with the pinned PyTorch 2.4.1 backend.
+# Newer 2026 releases import attention custom ops that require a newer torch.
+accelerate==0.34.2
 # The original decord 0.6.0 Linux wheel declares a CPython 3.6 ABI tag in
 # its internal metadata. decord2 keeps the same `import decord` API and ships
 # a native CPython 3.10 wheel.
 decord2==3.4.0
-diffusers>=0.30,<1
+diffusers==0.30.3
 dreamsim>=0.2,<1
 evo>=1.31,<2
 ipython>=8,<10
@@ -20,5 +22,5 @@ submitit>=1.5,<2
 torcheval==0.0.7
 torchmetrics>=1.4,<2
 tqdm>=4.66,<5
-transformers>=4.44,<6
+transformers==4.44.2
 typeguard>=4,<5

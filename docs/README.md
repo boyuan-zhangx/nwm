@@ -33,13 +33,14 @@ history in the first benchmark. Do not use generated frames as memory.
 | Component | Status | Supported entry point |
 | --- | --- | --- |
 | Python 3.10 setup and dependency checks | Ready | `python scripts/navware.py doctor` |
-| Existing model compatibility smoke | Ready | `python scripts/navware.py smoke` |
+| Phase A and model compatibility smoke | Ready | `python scripts/navware.py smoke` |
 | Dataset contract validation | Ready | `python scripts/validate_dataset.py` |
 | Geometric revisit manifest builder | Ready | `python scripts/build_revisit_manifest.py` |
 | Baseline NWM training and inference wrappers | Ready when data and a checkpoint are available | `scripts/train.sh`, `scripts/infer.sh` |
-| CDiT/S and CDiT/B experiment YAMLs | Not added | Use `CDiT-S/2` or `CDiT-B/2` and validate against the matching official checkpoint |
-| Four-slot context-policy selector | Not connected | Next implementation task; do not claim results yet |
-| Oracle/random/pose-aligned evaluation runner | Not connected | Implement after freezing a tiny revisit manifest |
+| CDiT/S and CDiT/B frozen inference YAMLs | Ready | `config/nwm_cdit_s.yaml`, `config/nwm_cdit_b.yaml` |
+| Deterministic four-slot context policies | Ready and unit-tested | `retrieval_context.py` |
+| Manifest-driven revisit inference and JSONL diagnostics | Ready when data and a checkpoint are available | `isolated_nwm_infer.py --revisit-manifest ...` |
+| Future-frame SSIM/LPIPS/DreamSim evaluator | Ready | `python scripts/evaluate_phase_a.py` |
 | `HybridCDiT` training and memory attention | Deferred Phase B | Do not submit a hybrid training job |
 
 If `doctor` reports `config:hybrid-training-data`, the selected configuration

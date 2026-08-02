@@ -23,10 +23,10 @@ Deliver a versioned revisit-event manifest, oracle/random historical indices,
 ground-truth future indices, a non-revisit query list, and a dataset validation
 report. Freeze thresholds before inspecting model outputs.
 
-### B. Context-policy implementation
+### B. Context-policy verification
 
-Implement a pure selector that consumes a query, real history, metadata, and a
-policy name, then returns exactly four source indices. Deliver unit tests for:
+The selector is implemented in `retrieval_context.py`. Run its tests and verify
+that every assigned dataset preserves:
 
 - `recent`, `random_history`, `oracle_manifest`, and `pose_aligned`;
 - deterministic random selection under a seed;
@@ -34,7 +34,8 @@ policy name, then returns exactly four source indices. Deliver unit tests for:
 - no cross-trajectory history;
 - identical shapes for all policies.
 
-Do not edit model architecture or training code for this work package.
+Do not edit the selector, model architecture, or training code merely to make a
+dataset pass. Report an invalid manifest with the failing trajectory and query.
 
 ### C. Oracle gate
 
@@ -54,9 +55,10 @@ scale-by-policy table and report an S-only gain explicitly.
 
 ### E. Evaluation
 
-Compare predictions with ground-truth future frames. Implement revisit and
-non-revisit metrics. Every policy must use the same directory schema, and
-aggregation code must read raw files rather than contain hand-entered numbers.
+Compare predictions with ground-truth future frames using
+`scripts/evaluate_phase_a.py`. Add non-revisit query manifests when assigned.
+Every policy must use the same directory schema, and aggregation must read raw
+files rather than contain hand-entered numbers.
 
 ### Deferred work: HybridCDiT
 
@@ -97,7 +99,7 @@ cp config/paths.example.yaml config/paths.local.yaml
 
 python scripts/navware.py doctor \
   --profile nwm \
-  --config config/nwm_cdit_xl.yaml \
+  --config config/nwm_cdit_s.yaml \
   --paths-config config/paths.local.yaml
 python scripts/navware.py smoke
 ```

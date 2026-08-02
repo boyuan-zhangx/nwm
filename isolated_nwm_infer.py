@@ -10,7 +10,10 @@ torch.backends.cudnn.allow_tf32 = True
 
 import yaml
 import argparse
+import json
 import os
+from pathlib import Path
+import random
 import numpy as np
 
 from diffusion import create_diffusion
@@ -20,8 +23,9 @@ import misc
 import distributed as dist
 from config_utils import load_config
 from models import CDiT_models
-from datasets import EvalDataset
+from datasets import EvalDataset, RevisitEvalDataset
 from PIL import Image
+from retrieval_context import CONTEXT_POLICIES
 
 
 def save_image(output_file, img, unnormalize_img):
@@ -63,13 +67,73 @@ def get_dataset_eval(config, dataset_name, eval_type, predefined_index=True):
     
     return dataset
 
+
+def required_prediction_steps(args, config):
+    if args.eval_type == "time":
+        if args.num_sec_eval < 1:
+            raise ValueError("num_sec_eval must be positive")
+        return (2 ** (args.num_sec_eval - 1)) * args.input_fps
+    if args.eval_type == "rollout":
+        return int(config["eval_len_traj_pred"])
+    raise ValueError("eval_type must be either 'time' or 'rollout'")
+
+
+def get_revisit_dataset_eval(config, dataset_name, args):
+    data_config = config["eval_datasets"][dataset_name]
+    return RevisitEvalDataset(
+        data_folder=data_config["data_folder"],
+        data_split_folder=data_config["test"],
+        dataset_name=dataset_name,
+        image_size=config["image_size"],
+        min_dist_cat=config["eval_distance"]["eval_min_dist_cat"],
+        max_dist_cat=config["eval_distance"]["eval_max_dist_cat"],
+        len_traj_pred=required_prediction_steps(args, config),
+        traj_stride=config["traj_stride"],
+        context_size=config["context_size"],
+        normalize=config["normalize"],
+        transform=misc.transform,
+        manifest_path=args.revisit_manifest,
+        context_policy=args.context_policy,
+        selection_seed=args.context_seed,
+        position_scale=args.pose_position_scale,
+        heading_scale_radians=np.deg2rad(args.pose_heading_scale_deg),
+        max_queries=args.max_revisit_queries,
+        goals_per_obs=4,
+        traj_names="traj_names.txt",
+    )
+
+
+def write_retrieval_diagnostics(
+    output_path, dataset, idxs, *, dataset_name, model_name, checkpoint, diffusion_seed,
+    append,
+):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if append else "w"
+    with output_path.open(mode, encoding="utf-8") as stream:
+        for raw_index in idxs.reshape(-1):
+            sample_index = int(raw_index.item())
+            record = dataset.get_diagnostic(sample_index)
+            record.update(
+                {
+                    "dataset": dataset_name,
+                    "model": model_name,
+                    "checkpoint": checkpoint,
+                    "diffusion_seed": diffusion_seed,
+                    "output_id": f"id_{sample_index}",
+                }
+            )
+            stream.write(json.dumps(record, sort_keys=True) + "\n")
+
 @torch.no_grad()
 def model_forward_wrapper(all_models, curr_obs, curr_delta, num_timesteps, latent_size, device, num_cond, num_goals=1, rel_t=None, progress=False):
     model, diffusion, vae = all_models
     x = curr_obs.to(device)
     y = curr_delta.to(device)
 
-    with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+    with torch.amp.autocast(
+        device_type=device.type, enabled=device.type == "cuda", dtype=torch.bfloat16
+    ):
         B, T = x.shape[:2]
 
         if rel_t is None:
@@ -117,7 +181,7 @@ def generate_time(args, output_dir, idxs, all_models, obs_image, gt_output, delt
         visualize_preds(output_dir, idxs, sec, x_pred_pixels)
 
 def visualize_preds(output_dir, idxs, sec, x_pred_pixels):
-    for batch_idx, sample_idx in enumerate(idxs.squeeze()):
+    for batch_idx, sample_idx in enumerate(idxs.reshape(-1)):
         sample_idx = int(sample_idx.item())
         sample_folder = os.path.join(output_dir, f'id_{sample_idx}')
         os.makedirs(sample_folder, exist_ok=True)
@@ -133,6 +197,21 @@ def main(args):
     global_rank = dist.get_rank()
     exp_eval = args.exp
 
+    dataset_names = args.datasets.split(',')
+    if args.revisit_manifest and len(dataset_names) != 1:
+        raise ValueError("a Phase A revisit run accepts exactly one dataset per command")
+    if not args.revisit_manifest and args.context_policy != "recent":
+        raise ValueError("replacement policies require --revisit-manifest")
+    if args.revisit_manifest and not Path(args.revisit_manifest).is_file():
+        raise FileNotFoundError(args.revisit_manifest)
+
+    process_seed = args.diffusion_seed + global_rank
+    random.seed(process_seed)
+    np.random.seed(process_seed)
+    torch.manual_seed(process_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(process_seed)
+
     # model & config setup
     if args.gt:
         args.save_output_dir = os.path.join(args.output_dir, 'gt')
@@ -142,6 +221,18 @@ def main(args):
     
     if  args.ckp != '0100000':
         args.save_output_dir = args.save_output_dir + "_%s"%(args.ckp)
+
+    if args.revisit_manifest:
+        if args.gt:
+            args.save_output_dir = os.path.join(args.save_output_dir, "phase_a")
+        else:
+            args.save_output_dir = os.path.join(
+                args.save_output_dir,
+                "phase_a",
+                args.context_policy,
+                f"context_seed_{args.context_seed}",
+                f"diffusion_seed_{args.diffusion_seed}",
+            )
 
     os.makedirs(args.save_output_dir, exist_ok=True)
 
@@ -158,19 +249,25 @@ def main(args):
         ckp = torch.load(f'{config["results_dir"]}/{config["run_name"]}/checkpoints/{args.ckp}.pth.tar', map_location='cpu', weights_only=False)
         print(model.load_state_dict(ckp["ema"], strict=True))
         model.eval()
+        model.requires_grad_(False)
         model.to(device)
-        model = torch.compile(model)
+        if args.torch_compile:
+            model = torch.compile(model)
         diffusion = create_diffusion(str(250))
         vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-ema").to(device)
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], find_unused_parameters=False)
         model_lst = (model, diffusion, vae)
 
     # Loading Datasets
-    dataset_names = args.datasets.split(',')
     datasets = {}
 
     for dataset_name in dataset_names:
-        dataset_val = get_dataset_eval(config, dataset_name, args.eval_type, predefined_index=True)
+        if args.revisit_manifest:
+            dataset_val = get_revisit_dataset_eval(config, dataset_name, args)
+        else:
+            dataset_val = get_dataset_eval(
+                config, dataset_name, args.eval_type, predefined_index=True
+            )
 
         if len(dataset_val) % num_tasks != 0:
             print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
@@ -196,9 +293,31 @@ def main(args):
         dataset_save_output_dir = os.path.join(args.save_output_dir, dataset_name)
         os.makedirs(dataset_save_output_dir, exist_ok=True)
         curr_data_loader = datasets[dataset_name]
+        diagnostics_written = False
+        diagnostics_path = os.path.join(
+            args.save_output_dir,
+            "metadata",
+            f"retrieval_{dataset_name}_rank_{global_rank}.jsonl",
+        )
         
         for data_iter_step, (idxs, obs_image, gt_image, delta) in enumerate(metric_logger.log_every(curr_data_loader, print_freq, header)):
-            with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+            if args.revisit_manifest:
+                write_retrieval_diagnostics(
+                    diagnostics_path,
+                    curr_data_loader.dataset,
+                    idxs,
+                    dataset_name=dataset_name,
+                    model_name=config["model"],
+                    checkpoint=args.ckp,
+                    diffusion_seed=args.diffusion_seed,
+                    append=diagnostics_written,
+                )
+                diagnostics_written = True
+            with torch.amp.autocast(
+                device_type=device.type,
+                enabled=device.type == "cuda",
+                dtype=torch.bfloat16,
+            ):
                 obs_image = obs_image[:, -num_cond:].to(device)
                 gt_image = gt_image.to(device)
                 num_cond = config["context_size"]
@@ -232,6 +351,35 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=8, help="num workers")
     parser.add_argument("--batch_size", type=int, default=16, help="batch size")
     parser.add_argument("--eval_type", type=str, default=None, help="type of evaluation has to be either 'time' or 'rollout'")
+    parser.add_argument(
+        "--revisit-manifest",
+        type=str,
+        default=None,
+        help="JSONL query manifest; enables Phase A context replacement",
+    )
+    parser.add_argument(
+        "--context-policy",
+        choices=CONTEXT_POLICIES,
+        default="recent",
+        help="fixed four-slot context policy",
+    )
+    parser.add_argument("--context-seed", type=int, default=0)
+    parser.add_argument("--diffusion-seed", type=int, default=0)
+    parser.add_argument("--pose-position-scale", type=float, default=0.75)
+    parser.add_argument("--pose-heading-scale-deg", type=float, default=20.0)
+    parser.add_argument(
+        "--max-revisit-queries",
+        type=int,
+        default=0,
+        help="optional global query cap for a gate run; zero uses the complete manifest",
+    )
+    parser.add_argument(
+        "--torch-compile",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="compile the frozen CDiT before inference",
+    )
     # Rollout Evaluation Args
     parser.add_argument("--rollout_fps_values", type=str, default='1,4', help="")
     parser.add_argument("--gt", type=int, default=0, help="set to 1 to produce ground truth evaluation set")

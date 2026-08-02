@@ -60,12 +60,15 @@ def trajectory_revisits(
     heading_wrong_threshold: float,
     query_stride: int,
     max_queries: int,
+    required_future_steps: int = 1,
     rng: random.Random,
 ) -> list[dict[str, Any]]:
     """Create one record per query with at least one geometric positive."""
 
     records: list[dict[str, Any]] = []
-    for query in range(min_temporal_gap, len(position) - 1, query_stride):
+    for query in range(
+        min_temporal_gap, len(position) - required_future_steps, query_stride
+    ):
         candidate_indices = np.arange(0, query - min_temporal_gap + 1)
         distance = np.linalg.norm(position[:, :2] - position[query, :2], axis=1)
         heading = wrapped_angle_difference(yaw, yaw[query])
@@ -101,6 +104,7 @@ def trajectory_revisits(
                 "query_position_xy": position[query, :2].tolist(),
                 "query_yaw": float(yaw[query]),
                 "query_action": [float(action_xy[0]), float(action_xy[1]), action_yaw],
+                "ground_truth_future_index": query + required_future_steps,
                 "positive_indices": _ordered(positives, distance, heading),
                 "heading_wrong_indices": _ordered(near_position, distance, heading),
                 "spatial_wrong_indices": _ordered(far_position, distance, heading),
@@ -113,6 +117,11 @@ def trajectory_revisits(
                     float(heading[index]) for index in _ordered(positives, distance, heading)
                 ],
                 "label_source": "geometry_v1",
+                "min_temporal_gap": min_temporal_gap,
+                "position_threshold": position_threshold,
+                "heading_threshold_radians": heading_threshold,
+                "heading_wrong_threshold_radians": heading_wrong_threshold,
+                "required_future_steps": required_future_steps,
             }
         )
         if max_queries > 0 and len(records) >= max_queries:
@@ -131,14 +140,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--heading-wrong-threshold-deg", type=float, default=90.0)
     parser.add_argument("--query-stride", type=int, default=1)
     parser.add_argument("--max-queries-per-trajectory", type=int, default=0)
+    parser.add_argument("--required-future-steps", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if args.min_temporal_gap < 1 or args.query_stride < 1:
-        raise SystemExit("min-temporal-gap and query-stride must be positive")
+    if (
+        args.min_temporal_gap < 1
+        or args.query_stride < 1
+        or args.required_future_steps < 1
+    ):
+        raise SystemExit(
+            "min-temporal-gap, query-stride, and required-future-steps must be positive"
+        )
     if args.position_threshold <= 0:
         raise SystemExit("position-threshold must be positive")
     if args.heading_wrong_threshold_deg <= args.heading_threshold_deg:
@@ -170,6 +186,7 @@ def main() -> int:
                 heading_wrong_threshold=np.deg2rad(args.heading_wrong_threshold_deg),
                 query_stride=args.query_stride,
                 max_queries=args.max_queries_per_trajectory,
+                required_future_steps=args.required_future_steps,
                 rng=rng,
             )
         )
@@ -188,6 +205,7 @@ def main() -> int:
             "position": args.position_threshold,
             "heading_deg": args.heading_threshold_deg,
             "heading_wrong_deg": args.heading_wrong_threshold_deg,
+            "required_future_steps": args.required_future_steps,
         },
     }
     print(json.dumps(summary, indent=2))

@@ -38,3 +38,25 @@ def test_load_config_rejects_unresolved_environment_variable(tmp_path):
 
     with pytest.raises(ValueError, match="results_dir"):
         load_config(defaults, experiment)
+
+
+@pytest.mark.parametrize(
+    ("filename", "model", "run_name"),
+    [
+        ("nwm_cdit_s.yaml", "CDiT-S/2", "nwm_cdit_s"),
+        ("nwm_cdit_b.yaml", "CDiT-B/2", "nwm_cdit_b"),
+    ],
+)
+def test_phase_a_small_configs_are_frozen_and_four_frame(filename, model, run_name):
+    repo_root = Path(__file__).resolve().parents[1]
+    config = load_config(
+        repo_root / "config" / "eval_config.yaml",
+        repo_root / "config" / filename,
+    )
+
+    assert config["model"] == model
+    assert config["run_name"] == run_name
+    assert config["context_size"] == 4
+    assert config["image_size"] == 224
+    assert config["train"] is False
+    assert config["phase_a_frozen"] is True
