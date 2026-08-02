@@ -1,41 +1,78 @@
-# 实习生交接清单
+# Intern Handoff Checklist
 
-## 第一天
+## Day-one checklist
 
-1. 阅读 `docs/README.md` 和本人任务对应章节。
-2. 激活 Python 3.10 环境：Linux/WSL 使用 `.venv-wsl`，Windows CPU 检查使用 `.venv`。
-3. 运行 `python scripts/navware.py doctor --profile nwm`。
-4. 运行 `python scripts/navware.py smoke`，必须全部通过。
-5. 创建自己的 `config/paths.local.yaml`，只改路径，不改 Python。
-6. 对分配的数据运行 dataset validator。
-7. 先跑 baseline tiny smoke，再接触 hybrid 或 cluster。
+1. Read `docs/README.md` and the chapter for the assigned task.
+2. Use Python 3.10 and activate the project Linux/WSL/cluster environment.
+3. Run `python scripts/navware.py doctor --profile nwm`.
+4. Run `python scripts/navware.py smoke`; every test must pass.
+5. Copy `config/paths.example.yaml` to `config/paths.local.yaml` and edit only
+   machine-specific paths.
+6. Run the dataset validator on the assigned split.
+7. Run a tiny baseline smoke before touching hybrid code or requesting a long
+   cluster job.
 
-## 可并行任务包
+Stop and report the exact command and complete error when any gate fails. Do not
+work around a failed gate by editing source, removing a check, or changing data.
 
-### A. Data / benchmark
+## Independent work packages
 
-输出 revisit event manifest、正确/错误 memory labels、dataset validation report。不得根据模型输出反向挑选阈值。
+### A. Data and benchmark
+
+Deliver a versioned revisit-event manifest, correct/wrong memory labels, and a
+dataset validation report. Freeze thresholds before inspecting model outputs.
 
 ### B. Retrieval
 
-输出 Recall@K/mAP、top-k 可视化、pose-only/action-only/combined/random 对照。只修改独立 retrieval 模块和 config，并补单测。
+Deliver Recall@K/mAP, top-k visualizations, and pose-only/action-only/combined/
+random comparisons. Modify only the retrieval module and config, and add tests.
 
-### C. Training
+### C. Training integration
 
-接入 memory batch、mask 和冻结策略；先 tiny overfit。输出 loss、gradient statistics、fixed samples、完整 YAML。
+Connect memory tensors, masks, and the freeze policy. Pass the tiny-overfit gate
+before any scale-up. Deliver loss curves, gradient statistics, fixed samples,
+and the complete YAML.
 
 ### D. Evaluation
 
-实现 non-regression 与 revisit-only 统计；对照组目录结构一致，汇总脚本不能手工填数字。
+Implement non-regression and revisit-only metrics. Every causal group must use
+the same directory schema, and aggregation code must read raw files rather than
+contain hand-entered numbers.
 
-## 每次提交必须包含
+## Required content for every pull request
 
-- 一句话 scientific question；
-- 修改过的 config；
-- 可复制命令；
-- 自动测试；
-- 输出路径和 commit hash；
-- 成功和失败案例；
-- 明确写出仍未回答的问题。
+- one sentence stating the scientific question;
+- every modified config;
+- an exact copy-paste command;
+- automated tests;
+- output location and commit hash;
+- representative success and failure cases;
+- an explicit list of questions that remain unanswered.
 
-禁止：硬编码个人路径、在 Python 中切换实验组、覆盖原 checkpoint、跨 trajectory 复用 memory、只汇报最好 seed、把尚未接通的功能写成已验证结果。
+## Prohibited practices
+
+- hard-coding a personal path or interpreter;
+- selecting experiment groups inside Python source;
+- overwriting a source checkpoint or prior raw output;
+- reusing memory across trajectories;
+- reporting only the best seed;
+- tuning ground-truth thresholds after viewing model results;
+- describing an unconnected or untested component as complete.
+
+## Copy-paste preflight
+
+```bash
+source /path/to/navware-venv/bin/activate
+cd /path/to/nwm
+
+cp config/paths.example.yaml config/paths.local.yaml
+# Edit config/paths.local.yaml before continuing.
+
+python scripts/navware.py doctor \
+  --profile nwm \
+  --config config/nwm_cdit_xl.yaml \
+  --paths-config config/paths.local.yaml
+python scripts/navware.py smoke
+```
+
+The preflight is complete only when doctor and smoke both succeed.

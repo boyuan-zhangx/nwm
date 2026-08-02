@@ -1,6 +1,6 @@
-# 数据契约
+# Dataset Contract
 
-## NWM trajectory 最小结构
+## Minimum NWM trajectory layout
 
 ```text
 DATA_ROOT/
@@ -11,43 +11,62 @@ DATA_ROOT/
     └── traj_data.pkl
 ```
 
-`traj_data.pkl` 至少包含：
+Each `traj_data.pkl` must contain at least:
 
-- `position`: `[T, >=2]`，全局位置；
-- `yaw`: `[T]` 或 `[T,1]`，弧度；
-- 图像编号与 pose 长度一致。
+- `position`: shape `[T, >=2]`, expressed in a consistent global frame;
+- `yaw`: shape `[T]` or `[T, 1]`, in radians;
+- one numbered image per pose entry.
 
-split 目录包含 `traj_names.txt`，每行一个 trajectory name。
+The split path must contain `traj_names.txt` with one trajectory name per line.
 
-## 验证命令
+## Validate before training
 
 ```bash
+export DATASET_ROOT=/path/to/dataset
+export SPLIT_PATH=data_splits/recon/train
+
 python scripts/validate_dataset.py \
-  --data-root /data/recon \
-  --split data_splits/recon/train \
+  --data-root "$DATASET_ROOT" \
+  --split "$SPLIT_PATH" \
   --max-trajectories 20
 ```
 
-先抽查 20 条，再去掉 `--max-trajectories` 做全量验证。Pickle 只能来自可信项目数据。
+Inspect 20 trajectories first. Remove `--max-trajectories` only after the sample
+passes. Load pickle files only from trusted project datasets.
 
-## Revisit benchmark 还需要的标注
+## Revisit benchmark labels
 
-每个样本必须保存：trajectory、query frame、候选 memory frame、pose distance、heading difference、temporal gap 和 scenario type。正确 memory 的定义要在看模型结果前固定，例如：
+Every benchmark record must preserve:
 
-- temporal gap 大于 native context；
-- position distance 小于阈值；
-- wrapped yaw difference 小于阈值；
-- 属于同一 landmark/revisit event。
+- trajectory and query frame;
+- candidate memory frames;
+- pose distance and wrapped heading difference;
+- temporal gap;
+- scenario or landmark identity;
+- the labeling rule and its version.
 
-这些标签用于 Recall@K/mAP，不能使用模型自己的 retrieval score 作为 ground truth。
+Define a correct memory before inspecting model outputs. A geometric candidate
+normally satisfies all of the following:
 
-## 生成第一版几何 revisit manifest
+- its temporal gap exceeds the native context;
+- its position distance is below a frozen threshold;
+- its wrapped yaw difference is below a frozen threshold;
+- it belongs to the same pre-annotated revisit event or landmark.
+
+These independent labels support Recall@K and mAP. A model's own retrieval score
+must never become its ground truth.
+
+## Build the first geometric manifest
 
 ```bash
+export DATASET_ROOT=/path/to/dataset
+export SPLIT_PATH=data_splits/recon/test
+export MANIFEST_OUTPUT=artifacts/manifests/recon_revisit_geometry_v1.jsonl
+
 python scripts/build_revisit_manifest.py \
-  --data-root /data/recon \
-  --split data_splits/recon/test \
-  --output artifacts/manifests/recon_revisit_geometry_v1.jsonl \
+  --data-root "$DATASET_ROOT" \
+  --split "$SPLIT_PATH" \
+  --output "$MANIFEST_OUTPUT" \
   --min-temporal-gap 8 \
   --position-threshold 0.75 \
   --heading-threshold-deg 20 \
@@ -55,4 +74,6 @@ python scripts/build_revisit_manifest.py \
   --seed 0
 ```
 
-`geometry_v1` 只给出 pose/heading positives 与几何 negatives。主论文案例还需要在看模型结果前冻结 landmark/scenario 标注；不要把几何 proximity 自动等同于 task relevance。
+`geometry_v1` provides pose/heading positives and geometric negatives only. For
+paper examples, freeze landmark and scenario annotations before viewing model
+results. Geometric proximity is not automatically task relevance.

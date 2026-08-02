@@ -1,13 +1,41 @@
-# 训练
+# Training
 
-## Baseline
+## Wrapper contract
 
-配置好 `config/paths.local.yaml` 后：
+The training wrapper accepts two required config files followed by unchanged
+`train.py` arguments:
+
+```text
+bash scripts/train.sh EXPERIMENT_CONFIG PATHS_CONFIG [train.py arguments...]
+```
+
+Both config paths may be absolute, relative to the caller's directory, or
+relative to the repository root. The wrapper validates both files, runs doctor,
+and starts training only if the preflight succeeds.
+
+Interpreter selection order:
+
+1. `NAVWARE_PYTHON`;
+2. the active `VIRTUAL_ENV`;
+3. the active `CONDA_PREFIX`;
+4. a repository-local `.venv-wsl` or `.venv`;
+5. `python3` or `python` from `PATH`.
+
+Interns should activate the project environment or set `NAVWARE_PYTHON`; they
+must not edit the wrapper to insert a personal interpreter path.
+
+## Baseline command
+
+Create and edit the ignored path overlay first:
 
 ```bash
+cp config/paths.example.yaml config/paths.local.yaml
+export EXPERIMENT_CONFIG=config/nwm_cdit_xl.yaml
+export PATHS_CONFIG=config/paths.local.yaml
+
 bash scripts/train.sh \
-  config/nwm_cdit_xl.yaml \
-  config/paths.local.yaml \
+  "$EXPERIMENT_CONFIG" \
+  "$PATHS_CONFIG" \
   --epochs 1 \
   --ckpt-every 2000 \
   --eval-every 10000 \
@@ -15,30 +43,38 @@ bash scripts/train.sh \
   --torch-compile 0
 ```
 
-本地 smoke 使用 S/B model、较小 image size、`num_workers: 0` 和 tiny split。XL 不用于验证数据管线。
+Do not use the XL model to debug the data pipeline. A local smoke run uses an
+S/B model, reduced image size, `num_workers: 0`, a tiny split, and a dedicated
+experiment YAML.
 
-## LT-NWM 当前边界
+## Current LT-NWM boundary
 
-`HybridCDiT` 已做到：
+`HybridCDiT` currently provides:
 
-- memory buffer 与 diffusion denoiser 生命周期分离；
-- memory 以显式 `memory_latents [B,M,C,H,W]` 输入；
-- memory attention 接受 padding mask；
-- baseline checkpoint 可 `strict=False` 加载，missing keys 仅为 memory branch；
-- memory gate 零初始化，初始输出与 baseline 一致。
+- a memory buffer lifecycle separate from the diffusion denoiser;
+- explicit `memory_latents` with shape `[B, M, C, H, W]`;
+- a padding mask for memory attention;
+- baseline checkpoint loading with `strict=False`, where missing keys are
+  limited to the memory branch;
+- a zero-initialized memory gate, making the initial output match the baseline.
 
-尚未做到：`TrainingDataset` 产生历史 memory candidates、pose 和 mask，`train.py` 把它们送入 diffusion `model_kwargs`。因此现在运行 hybrid YAML 不能训练 memory branch。
+The missing path is critical: `TrainingDataset` does not yet produce historical
+memory candidates, poses, or masks, and `train.py` does not yet pass those
+tensors through diffusion `model_kwargs`. A hybrid YAML alone therefore cannot
+train the memory branch. Do not submit a long hybrid job yet.
 
-## Tiny-subset overfit 验收
+## Tiny-subset overfit gate
 
-数据：单场景 8-32 条包含 revisit 的轨迹。训练：冻结 VAE 和大部分 CDiT，只打开 memory attention/gate，固定 seed 与 fixed visualization samples。
+Use one scenario and 8-32 trajectories that contain revisits. Freeze the VAE
+and most of CDiT, train only the memory attention and gate, fix every seed, and
+keep a fixed visualization set.
 
-通过条件：
+The gate passes only if all conditions hold:
 
-1. train loss 明显下降；
-2. memory gate 与 attention 参数有非零、有限梯度；
-3. fixed train sample 的 revisit 预测改善；
-4. correct memory 优于 random memory；
-5. no-memory 输出在初始化时与 baseline 数值一致。
+1. training loss decreases substantially;
+2. memory gate and attention parameters receive finite non-zero gradients;
+3. predictions improve on fixed training revisit samples;
+4. correct memory outperforms random memory;
+5. no-memory output matches the baseline at initialization.
 
-未通过不得扩大 batch、模型或节点数。
+Do not increase model size, batch size, or node count before this gate passes.

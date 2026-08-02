@@ -1,12 +1,29 @@
-# 推理
+# Inference
 
-## Baseline 入口
+## Wrapper contract
+
+The inference wrapper accepts two required config files followed by unchanged
+`isolated_nwm_infer.py` arguments:
+
+```text
+bash scripts/infer.sh EXPERIMENT_CONFIG PATHS_CONFIG [inference arguments...]
+```
+
+It uses the same interpreter and config resolution rules as `scripts/train.sh`,
+validates the environment with doctor, and refuses to launch when a config file
+is missing. Do not insert a personal path into the script.
+
+## Baseline command
 
 ```bash
+export EXPERIMENT_CONFIG=config/nwm_cdit_xl.yaml
+export PATHS_CONFIG=config/paths.local.yaml
+export RUN_OUTPUT=/path/to/results/nwm-baseline
+
 bash scripts/infer.sh \
-  config/nwm_cdit_xl.yaml \
-  config/paths.local.yaml \
-  --output_dir /results/nwm \
+  "$EXPERIMENT_CONFIG" \
+  "$PATHS_CONFIG" \
+  --output_dir "$RUN_OUTPUT" \
   --ckp 0100000 \
   --datasets recon \
   --eval_type rollout \
@@ -15,26 +32,38 @@ bash scripts/infer.sh \
   --num_workers 0
 ```
 
-## LT-NWM 正确 lifecycle
+Use a new output directory for every commit/config/seed combination. Never
+overwrite the source checkpoint or a previous run's raw outputs.
 
-Memory buffer 不能在 `HybridCDiT.forward` 内更新。一次视频 frame 会调用 denoiser 数百次，在 forward 内更新会把 diffusion steps 当成历史视频帧。
+## Correct LT-NWM memory lifecycle
 
-每个 rollout step 必须按以下顺序执行：
+The memory buffer must not update inside `HybridCDiT.forward`. The denoiser is
+called hundreds of times for one generated frame; updating there would treat
+diffusion steps as historical video frames.
 
-1. 根据 current global pose、target action 查询一次 buffer；
-2. 得到 top-k VAE latents、frame indices、retrieval scores；
-3. 同一组 memory latents 供该 frame 的全部 diffusion steps 使用；
-4. 完成 decode 后，只把一个真实 observation 或最终预测 latent 写入 buffer；
-5. trajectory 结束立即 clear，禁止 batch/trajectory 间泄漏。
+Each rollout step must follow this order:
 
-## 必须支持的推理组
+1. Query the buffer once using the current global pose and target action.
+2. Produce top-k VAE latents, source frame indices, retrieval scores, and mask.
+3. Reuse that exact memory set for every diffusion step of the generated frame.
+4. After decoding, write exactly one real observation or final predicted latent
+   to the buffer.
+5. Clear the buffer at the trajectory boundary. Never leak memory across batch
+   items or trajectories.
+
+## Required causal groups
 
 - `no_memory`
 - `correct_memory`
 - `random_memory`
-- `temporal_wrong_memory`
-- `visual_similar_wrong_memory`
+- `temporally_wrong_memory`
+- `heading_wrong_memory`
 
-每次推理保存 query、top-k frames、indices、各 score component、memory mask、gate statistics、prediction 和 seed。没有这些 diagnostics 的视频不能用于机制结论。
+Every run must save the query, top-k source frames, source indices, each score
+component, memory mask, gate statistics, prediction, and seed. A qualitative
+video without those diagnostics cannot support a mechanism claim.
 
-五组的冻结规范位于 `experiments/e04_memory_causal_ablation.yaml`。当前状态是 `specification`；只有 runner 真正消费并验证全部字段后才能改成 runnable/executed。
+The frozen group specification is
+`experiments/e04_memory_causal_ablation.yaml`. Its current status is
+`specification`. Change that status only after a runner consumes and validates
+every field.

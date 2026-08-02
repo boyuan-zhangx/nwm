@@ -1,110 +1,122 @@
-# 本地 WSL 环境
+# Local WSL Setup
 
-## 已验证的负责人机器
+## Verified reference environment
 
-2026-08-02 实机验证：
+The maintainer verified the following combination on 2026-08-02:
 
-- Ubuntu 22.04 / Python 3.10；
-- PyTorch `2.4.1+cu124`；
-- NVIDIA GeForce RTX 4060 Laptop GPU，CUDA runtime 可用；
-- `doctor` 17/17、完整测试 11/11、实际 CUDA 矩阵运算通过。
+- Ubuntu 22.04 and Python 3.10;
+- PyTorch `2.4.1+cu124`;
+- an NVIDIA RTX 4060 visible from WSL;
+- doctor 17/17, the complete test suite, and a real CUDA tensor operation.
 
-Windows `.venv` 只用于 CPU 单测。WSL 与 Windows 不得共用同一个
-virtualenv。
+This is a reference, not a required personal path layout. Windows and WSL must
+not share a virtual environment. A Windows venv contains Windows executables;
+a WSL venv contains Linux executables.
 
-## 先决定磁盘布局
+## Storage layout
 
-WSL distribution 默认把 `ext4.vhdx` 放在 C 盘。即使仓库位于
-`/mnt/d`，Linux 的 `/home`、`/tmp` 和 pip cache 仍会占用 VHDX 所在
-磁盘。C 盘耗尽会表现为安装无输出、`getpwnam failed` 或
-`CreateInstance/E_FAIL`。
+WSL stores its Linux filesystem in an `ext4.vhdx`. By default that virtual disk
+is usually on the Windows system drive. A repository on a mounted Windows drive
+does not change where Linux `/home`, `/tmp`, or the pip cache are stored. When
+the system drive fills, WSL can fail with misleading errors such as
+`getpwnam failed` or `CreateInstance/E_FAIL`.
 
-负责人机器采用以下布局：
+Recommended layout:
 
-- 仓库：`D:\Navware_workspace\nwm`；
-- Ubuntu VHDX：`D:\WSL\Ubuntu-22.04`；
-- WSL venv：`/home/zhang/.venvs/navware-nwm`；
-- 仓库 `.venv-wsl`：指向上述 venv 的本地符号链接。
+1. Move the WSL distribution to a drive with sufficient free space if needed.
+2. Clone the repository inside the Linux filesystem, for example under
+   `~/src/nwm`, for the best small-file performance.
+3. Keep the venv inside the Linux filesystem.
+4. Keep large datasets and outputs on an appropriate data drive or cluster
+   filesystem and expose them through `config/paths.local.yaml`.
 
-对已经安装且处于停止状态的发行版，可在 PowerShell 中迁移：
+Recent WSL versions support distribution migration from PowerShell:
 
 ```powershell
 wsl --shutdown
-wsl --manage Ubuntu-22.04 --move D:\WSL\Ubuntu-22.04
+wsl --manage Ubuntu-22.04 --move <large-drive>:\WSL\Ubuntu-22.04
 ```
 
-执行前确认目标目录不存在、D 盘空间充足，并保留重要数据备份。
+Replace `<large-drive>` before running the command. Confirm that the target does
+not already exist, that the destination has enough space, and that important
+Linux data is backed up.
 
-不要把大型 Linux venv 直接安装到 `/mnt/c` 或 `/mnt/d`。把 venv 放在
-Linux 文件系统中，依赖安装和 import 都会更快。
+## Install the CUDA environment
 
-## 首次创建 CUDA 环境
+From an Ubuntu shell:
 
 ```bash
-cd /mnt/d/Navware_workspace/nwm
-
 sudo apt update
-sudo apt install -y python3.10-venv ffmpeg
+sudo apt install -y python3.10-venv ffmpeg git
 
-mkdir -p ~/.venvs
-bash setup_nwm_env.sh \
-  --profile nwm \
-  --backend cu124 \
-  --venv ~/.venvs/navware-nwm
+mkdir -p ~/src
+cd ~/src
+git clone https://github.com/boyuan-zhangx/nwm.git
+cd nwm
 
-# 仅在仓库中还不存在 .venv-wsl 时执行。
-ln -s ~/.venvs/navware-nwm .venv-wsl
-
+bash setup_nwm_env.sh --profile nwm --backend cu124
 source .venv-wsl/bin/activate
+
 python scripts/navware.py doctor --profile nwm
 python scripts/navware.py smoke
 ```
 
-安装成功后可以删除下载缓存，但不能删除 venv：
+Use `--backend cpu` only on a machine without a visible NVIDIA GPU. On a GPU
+machine, run `nvidia-smi` first and select one of the backends supported by the
+setup script. The locally installed CUDA toolkit version does not select the
+PyTorch wheel; the driver and wheel compatibility do.
+
+After a successful installation, the wheel download cache may be removed:
 
 ```bash
 python -m pip cache purge
 ```
 
-只有没有可见 NVIDIA GPU 的 CI/开发机才使用 `--backend cpu`。有 GPU 时
-先运行 `nvidia-smi`，再选择仓库支持的 PyTorch wheel backend；不要根据
-系统 CUDA toolkit 版本猜 wheel。
+Do not delete the venv itself.
 
-## Git ownership
+## Repository on a mounted Windows drive
 
-仓库由 Windows Git clone 时，WSL Git 可能报告 `detected dubious
-ownership`。由当前 WSL 用户执行一次：
+This layout is supported but slower for dependency installation. Put the venv
+under Linux home and tell the setup script where to create it:
 
 ```bash
-git config --global --add safe.directory /mnt/d/Navware_workspace/nwm
+cd /path/to/mounted/repository
+export NAVWARE_VENV="$HOME/.venvs/navware-nwm"
+mkdir -p "$(dirname "$NAVWARE_VENV")"
+
+bash setup_nwm_env.sh \
+  --profile nwm \
+  --backend cu124 \
+  --venv "$NAVWARE_VENV"
+
+source "$NAVWARE_VENV/bin/activate"
+export NAVWARE_PYTHON="$NAVWARE_VENV/bin/python"
 ```
 
-## 日常使用
+The train and inference wrappers honor the active `VIRTUAL_ENV`, active Conda
+environment, and `NAVWARE_PYTHON`; a repository-local venv is not required.
+
+If Git reports `detected dubious ownership` for a Windows-owned repository,
+run this once from the repository root:
 
 ```bash
-cd /mnt/d/Navware_workspace/nwm
-source .venv-wsl/bin/activate
-
-python scripts/navware.py doctor --profile nwm
-python scripts/navware.py smoke
+git config --global --add safe.directory "$(pwd)"
 ```
 
-Windows 和 WSL 的激活入口分别是：
-
-- Windows：`.venv/Scripts/python.exe`；
-- WSL：`.venv-wsl/bin/python`。
-
-## 配置路径，不改源码
+## Configure paths without editing source
 
 ```bash
 cp config/paths.example.yaml config/paths.local.yaml
-export NAVWARE_DATA_ROOT=/path/to/data
-export NAVWARE_RESULTS_ROOT=/path/to/results
+```
+
+Edit the copied file, then validate it:
+
+```bash
 python scripts/navware.py doctor \
   --profile nwm \
   --config config/nwm_cdit_xl.yaml \
   --paths-config config/paths.local.yaml
 ```
 
-`config/paths.local.yaml` 被 Git ignore。每台机器只有这一份本地路径文件，
-实验 YAML 可以共享。
+`config/paths.local.yaml` is ignored by Git. Each machine has one local overlay;
+experiment YAML files remain portable and reviewable.

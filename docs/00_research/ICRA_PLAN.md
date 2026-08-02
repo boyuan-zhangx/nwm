@@ -1,44 +1,58 @@
-# ICRA 2027 研究计划
+# ICRA 2027 Research Plan
 
-## 判断
+## Scope decision
 
-计划是有条件可行，不是稳妥可行。官方投稿截止时间是 2026-09-15 23:59 PST，当前从 2026-08-02 起约有 44 天。这个时间只够完成一个窄主张：
+The plan is feasible only with a narrow claim and hard go/no-go gates. At the
+planning date of 2026-08-02, approximately 44 days remained before the official
+submission deadline of 2026-09-15 at 23:59 PST.
 
-> NWM 在 revisit-like navigation 中因短上下文产生长期空间不一致；外部 memory、正确 retrieval 与可学习的 selective fusion 能缓解该 failure mode，同时不显著破坏短期生成质量。
+Target claim:
 
-官方日期：https://2027.ieee-icra.org/contribute/call-for-icra-2027-papers-now-accepting-submissions/
+> Short-context NWM produces long-horizon spatial inconsistencies in
+> revisit-like navigation. External memory, correct retrieval, and learned
+> selective fusion reduce this failure mode without materially degrading
+> short-horizon generation quality.
 
-不进入主线：换 backbone、完整 MPC、multi-sensor、online learning、object-centric learning、全面 SOTA。
+Official deadline:
+<https://2027.ieee-icra.org/contribute/call-for-icra-2027-papers-now-accepting-submissions/>
 
-## 必须闭合的四段证据
+Out of scope for this submission: a new backbone, full MPC, multi-sensor
+fusion, online learning, object-centric learning, and a broad SOTA sweep.
 
-1. Failure existence：固定数据、checkpoint、seed，证明 revisit/turn-back/loop 中 baseline failure 可复现。
-2. Mechanism validity：retrieval Recall@K 与可视化证明取到了正确历史，而不只是外观相似帧。
-3. Causal evidence：correct memory 优于 no/random/temporally-wrong/visually-similar-wrong memory。
-4. Non-regression：LPIPS、DreamSim 等旧指标没有明显恶化。
+## Required evidence chain
 
-## 硬性 go/no-go 日期
+1. **Failure existence:** reproduce baseline failures on fixed revisit,
+   turn-back, and loop cases using fixed data, checkpoint, and seeds.
+2. **Mechanism validity:** use Recall@K and retrieval visualizations to show
+   that the method retrieves the relevant history, not only similar images.
+3. **Causal evidence:** show that correct memory outperforms no memory,
+   random memory, temporally wrong memory, and visually similar wrong memory.
+4. **Non-regression:** show that standard LPIPS, DreamSim, and related quality
+   metrics do not materially regress.
 
-| 日期 | 必须交付 | 失败后的动作 |
+## Hard go/no-go gates
+
+| Date | Required deliverable | Action if the gate fails |
 | --- | --- | --- |
-| 08-06 | setup、doctor、dataset validator、baseline smoke 全通过 | 暂停模型开发，先修基础设施 |
-| 08-12 | tiny subset 能 overfit；memory gate/attention 有非零梯度 | 放弃 full training，转 retrieval/benchmark 备线 |
-| 08-20 | correct memory 明显优于 random/wrong memory | 不得宣称 memory mechanism 有效 |
-| 08-30 | 主实验和三随机种子完成，原始输出冻结 | 只补关键缺口，不增加模块 |
-| 09-05 | 全部表格、主图、定性视频定稿 | 冻结实验代码 |
-| 09-09 | 第一版完整论文和 accompanying video | 只做复核与文字修改 |
-| 09-15 | 投稿 | 不在最后 48 小时启动新训练 |
+| 2026-08-06 | Setup, doctor, dataset validator, and baseline smoke all pass | Stop model work and repair infrastructure |
+| 2026-08-12 | Tiny subset overfits; memory gate and attention receive finite non-zero gradients | Drop full training and switch to the retrieval/benchmark fallback |
+| 2026-08-20 | Correct memory clearly outperforms random and wrong memory | Do not claim an effective memory mechanism |
+| 2026-08-30 | Main runs and three seeds complete; raw outputs frozen | Fill only critical gaps; add no new module |
+| 2026-09-05 | Tables, main figures, and qualitative video frozen | Freeze experiment code |
+| 2026-09-09 | Complete paper draft and accompanying video | Perform verification and writing edits only |
+| 2026-09-15 | Submission | Start no new training in the final 48 hours |
 
-## 最小实验矩阵
+## Minimum experiment matrix
 
-| ID | 目的 | 组别 |
+| ID | Question | Required comparison |
 | --- | --- | --- |
-| E00 | 工程闭环 | doctor, tests, one-batch baseline |
-| E01 | failure census | NWM on turn-return, full rotation, revisit, loop |
-| E02 | retrieval validity | pose-only, action-only, pose+action, random |
-| E03 | learnability | tiny subset, frozen backbone, memory branch only |
-| E04 | causal ablation | no/correct/random/temporal-wrong/visual-wrong memory |
-| E05 | main result | baseline vs LT-NWM, same data/compute/seeds |
-| E06 | minimal ablation | top-k and memory layer location；最多两项 |
+| E00 | Does the engineering loop work? | doctor, tests, one-batch baseline |
+| E01 | Where does baseline NWM fail? | turn-return, full rotation, revisit, loop |
+| E02 | Is retrieval valid? | pose-only, action-only, pose+action, random |
+| E03 | Is the memory branch learnable? | tiny subset, frozen backbone, memory branch only |
+| E04 | Is the effect causal? | no/correct/random/temporal-wrong/visual-wrong memory |
+| E05 | Does the complete method help? | baseline vs. LT-NWM with matched data, compute, and seeds |
+| E06 | Which minimal design choice matters? | top-k and memory layer location; at most two axes |
 
-先回答机制问题，再扩大训练。Cluster 只放大已经在 tiny experiment 中通过的实验。
+Answer the mechanism question before scaling. The cluster amplifies only an
+experiment that already passed its tiny local gate.

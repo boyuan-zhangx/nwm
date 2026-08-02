@@ -1,43 +1,112 @@
-# Cluster 环境与提交规范
+# Cluster Setup and Job Contract
 
-## 首次安装
+## One-time installation
 
 ```bash
 git clone https://github.com/boyuan-zhangx/nwm.git
 cd nwm
-bash setup_nwm_env.sh --profile nwm --backend cu124
-source .venv-wsl/bin/activate
+
+export NAVWARE_VENV="${NAVWARE_VENV:-$HOME/.venvs/navware-nwm}"
+bash setup_nwm_env.sh \
+  --profile nwm \
+  --backend cu124 \
+  --venv "$NAVWARE_VENV"
+
+source "$NAVWARE_VENV/bin/activate"
 ```
 
-如果 cluster module 提供的 driver 不支持 cu124，先记录 `nvidia-smi`，再选择 `cu121`；不要使用旧 README 中未固定日期的 nightly wheel。
+Run `nvidia-smi` before selecting a backend. Use `cu121` only when the cluster
+driver cannot support the repository's `cu124` wheel. Do not use an unpinned
+nightly PyTorch wheel from an old README.
 
-LT-NWM 不直接 import vendored `WorldMem/`。只有复现 upstream WorldMem Minecraft baseline 时才运行：
+The LT-NWM path does not import the vendored `WorldMem/` package. Install that
+package only when reproducing the upstream WorldMem Minecraft baseline:
 
 ```bash
 python worldmem_setup_and_test.py install --dry-run
 python worldmem_setup_and_test.py install
 ```
 
-## 每个 job 必须记录
+## Machine-local paths
+
+Create one ignored overlay per machine or cluster account:
 
 ```bash
-git rev-parse HEAD > run_commit.txt
+cp config/paths.example.yaml config/paths.local.yaml
+```
+
+Edit only `config/paths.local.yaml` to point at datasets, checkpoints, and
+result storage. Shared experiment YAML files must not contain account names,
+home directories, scratch roots, tokens, or host-specific mount points.
+
+## Required metadata for every job
+
+Run these commands inside the job output directory:
+
+```bash
+git -C /path/to/nwm rev-parse HEAD > run_commit.txt
 python -m pip freeze > environment.txt
 nvidia-smi > nvidia_smi.txt
-cp EXPERIMENT.yaml resolved_experiment.yaml
-cp config/paths.local.yaml resolved_paths.yaml
+cp "$EXPERIMENT_CONFIG" resolved_experiment.yaml
+cp "$PATHS_CONFIG" resolved_paths.yaml
 ```
 
-不要把 token、W&B key 或个人目录提交进 Git。结果目录至少包含：`checkpoints/`、`logs/`、`metrics/`、`visualizations/`、`metadata/`。
+Never commit tokens, W&B keys, or personal directories. Every run directory
+must contain at least:
 
-## 提交前 gate
+```text
+checkpoints/
+logs/
+metrics/
+visualizations/
+metadata/
+```
 
-只有以下全部通过才允许申请长任务：
+## Gate before a long job
+
+Set the paths once, then run all checks:
 
 ```bash
-python scripts/navware.py doctor --profile nwm --config EXPERIMENT.yaml --paths-config config/paths.local.yaml
+export EXPERIMENT_CONFIG=config/nwm_cdit_xl.yaml
+export PATHS_CONFIG=config/paths.local.yaml
+export DATASET_ROOT=/path/to/dataset
+export SPLIT_FILE=data_splits/recon/train
+
+python scripts/navware.py doctor \
+  --profile nwm \
+  --config "$EXPERIMENT_CONFIG" \
+  --paths-config "$PATHS_CONFIG"
 python scripts/navware.py smoke
-python scripts/validate_dataset.py --data-root DATASET --split SPLIT --max-trajectories 20
+python scripts/validate_dataset.py \
+  --data-root "$DATASET_ROOT" \
+  --split "$SPLIT_FILE" \
+  --max-trajectories 20
 ```
 
-Hybrid job 还必须先提交 tiny-overfit 的 loss curve、fixed sample 和 correct-vs-random 初步结果。
+A hybrid job additionally requires a tiny-overfit loss curve, fixed samples,
+finite non-zero memory gradients, and an initial correct-vs-random comparison.
+
+## Submit through Slurm
+
+`nwm.sh` is a site-neutral Slurm adapter. Do not edit it to insert a personal
+directory, partition, account, node name, or Conda installation. Pass
+site-specific scheduler values to `sbatch`:
+
+```bash
+export NAVWARE_VENV="$HOME/.venvs/navware-nwm"
+export EXPERIMENT_CONFIG=config/nwm_cdit_xl.yaml
+export PATHS_CONFIG=config/paths.local.yaml
+
+sbatch \
+  --partition=YOUR_GPU_PARTITION \
+  --account=YOUR_ACCOUNT \
+  nwm.sh \
+  "$EXPERIMENT_CONFIG" \
+  "$PATHS_CONFIG" \
+  --epochs 1 \
+  --bfloat16 1
+```
+
+Add `--constraint`, `--nodelist`, or a different time limit on the `sbatch`
+command only when required by the site. The job adapter delegates preflight and
+training to `scripts/train.sh`, so local and cluster runs use the same contract.

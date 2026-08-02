@@ -1,29 +1,46 @@
-# 评估
+# Evaluation
 
-## 两类指标
+## Metric families
 
-Non-regression：LPIPS、DreamSim、FID/FVD 等原始生成质量指标。目标是不明显破坏旧能力，不要求所有指标都刷新 SOTA。
+**Non-regression metrics** measure the original generation capability: LPIPS,
+DreamSim, FID/FVD, and any metric already used by the baseline. The goal is to
+avoid a material regression, not to claim SOTA on every generic metric.
 
-Memory-specific：
+**Memory-specific metrics** test the proposed mechanism:
 
-- Retrieval Recall@K / mAP：相对独立的 pose-heading-revisit 标签；
-- Revisit prediction error：只在预先定义的 revisit frames 上计算 LPIPS/DreamSim；
-- Correct-memory causal gain：`metric(wrong/random) - metric(correct)`；
-- Failure rate：teleportation、landmark identity break、mode collapse，由盲评规则或独立 estimator 判定。
+- Retrieval Recall@K and mAP against independent pose-heading-revisit labels.
+- Revisit prediction error, measured only on pre-declared revisit frames.
+- Correct-memory causal gain, for example
+  `metric(wrong_or_random) - metric(correct)` when lower is better.
+- Failure rate for teleportation, landmark identity breaks, and mode collapse,
+  measured by a frozen blind-review rule or independent estimator.
 
-不要用内部 retrieval score 评价 retrieval score，这会形成循环论证。
+Never evaluate a retrieval score against labels derived from the same retrieval
+score. That would be circular evidence.
 
-## 公平比较
+## Fair comparison contract
 
-Baseline 与 LT-NWM 必须使用相同 dataset split、checkpoint initialization、diffusion steps、seed、输入 context、image size 和算力预算。至少三个 seed；先报告每个 seed，再报告 mean ± std。
+Baseline and LT-NWM must use identical:
 
-## 最小主表
+- dataset split;
+- checkpoint initialization;
+- diffusion step count;
+- random seeds;
+- input context;
+- image size;
+- compute budget.
 
-| Method | LPIPS ↓ | DreamSim ↓ | Recall@1 ↑ | Recall@5 ↑ | Revisit error ↓ | Failure rate ↓ |
+Use at least three seeds. Preserve and report every seed before reporting mean
+and standard deviation. Do not discard a run because its result is unfavorable.
+
+## Minimum main table
+
+| Method | LPIPS lower | DreamSim lower | Recall@1 higher | Recall@5 higher | Revisit error lower | Failure rate lower |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | NWM | | | N/A | N/A | | |
-| LT-NWM no memory | | | | | | |
-| LT-NWM random memory | | | | | | |
-| LT-NWM correct memory | | | | | | |
+| LT-NWM, no memory | | | | | | |
+| LT-NWM, random memory | | | | | | |
+| LT-NWM, correct memory | | | | | | |
 
-若 correct 与 wrong/random 没有稳定差异，就不能把 improvement 归因于 retrieval 或 memory。
+If correct memory does not show a stable advantage over wrong and random memory,
+the improvement cannot be attributed to retrieval or external memory.

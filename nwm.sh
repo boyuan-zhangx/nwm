@@ -1,29 +1,60 @@
-#!/bin/bash
-#SBATCH --job-name=nwm_training_job
-#SBATCH --partition=ENSTA-l40s
+#!/usr/bin/env bash
+# Generic Slurm adapter. Supply site-specific partition, account, and node
+# constraints as `sbatch` command-line options rather than editing this file.
+#SBATCH --job-name=navware-train
 #SBATCH --gpus=1
-#SBATCH --time=23:50:00
-#SBATCH --nodelist=ensta-l40s01.r2.enst.fr
-#SBATCH --output=l40s_job_%j.out
-#SBATCH --error=l40s_job_%j.err
+#SBATCH --time=24:00:00
+#SBATCH --output=slurm-%x-%j.out
+#SBATCH --error=slurm-%x-%j.err
 
-echo "✅ Job started on node: $(hostname) / 任务运行节点：$(hostname)"
-echo "🕒 Start time: $(date) / 开始时间：$(date)"
+set -euo pipefail
 
-#load conda environment
-source ~/miniconda3/etc/profile.d/conda.sh || { echo "❌ Failed to load conda.sh / 无法加载 conda.sh"; exit 1; }
-conda activate nwm-env || { echo "❌ Failed to activate conda env / 激活 Conda 环境失败"; exit 1; }
+usage() {
+  cat <<'EOF'
+Usage:
+  sbatch [site options] nwm.sh EXPERIMENT_CONFIG PATHS_CONFIG [train.py arguments...]
 
-# switch to the directory containing the code
-cd ${HOME}/boyuan/nwm || { echo "❌ Directory not found: ${HOME}/boyuan/nwm / 找不到代码目录"; exit 1; }
+Optional environment variables:
+  NAVWARE_VENV    Virtual environment directory to activate inside the job.
+  NAVWARE_PYTHON  Python executable consumed by scripts/train.sh.
 
-echo "🚀 Starting model training... / 开始模型训练..."
+Example:
+  export NAVWARE_VENV="$HOME/.venvs/navware-nwm"
+  sbatch --partition=GPU nwm.sh \
+    config/nwm_cdit_xl.yaml \
+    config/paths.local.yaml \
+    --epochs 1
+EOF
+}
 
-# replace with your training command
-python train.py --config config/hybrid_nwm_cdit_l_latents_L40S.yaml
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
 
-#example command for training with specific parameters
-# python train.py --config config/nwm_cdit_xl.yaml --device cuda --batch_size 8 --num_workers 4
+if (($# < 2)); then
+  usage >&2
+  exit 2
+fi
 
-echo "✅ Training finished. / 训练完成。"
-echo "🕓 End time: $(date) / 结束时间：$(date)"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${REPO_ROOT}"
+
+if [[ -n "${NAVWARE_VENV:-}" ]]; then
+  if [[ ! -r "${NAVWARE_VENV}/bin/activate" ]]; then
+    echo "NAVWARE_VENV is not a readable virtual environment: ${NAVWARE_VENV}" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "${NAVWARE_VENV}/bin/activate"
+fi
+
+printf '[navware] Job ID: %s\n' "${SLURM_JOB_ID:-local-shell}"
+printf '[navware] Host: %s\n' "$(hostname)"
+printf '[navware] Started: %s\n' "$(date --iso-8601=seconds)"
+
+bash scripts/train.sh "$@"
+
+printf '[navware] Finished: %s\n' "$(date --iso-8601=seconds)"
