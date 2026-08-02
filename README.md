@@ -1,6 +1,12 @@
 ## Navigation World Models, CVPR 2025 (Oral) <br><sub>Official PyTorch Implementation</sub>
 
-> NavWare fork: LT-NWM research status, reproducible setup, training/inference handoff, and experiment gates are documented in [docs/README.md](docs/README.md). The hybrid memory branch is still under validation; read its status before launching cluster jobs.
+> NavWare fork: the current ICRA 2027 route is **retrieval-based context
+> replacement with a frozen NWM checkpoint**, not hybrid-memory training. Start
+> with the [experiment handbook](docs/README.md) and pass the oracle gate before
+> launching scaled jobs. Use official CDiT/S for development and ablations,
+> then confirm only the core result on CDiT/B and CDiT/XL. The existing
+> `HybridCDiT` code is preserved only as a deferred Phase B option; see [its
+> status](README_Hybrid_Memory.md).
 
 ### [Paper](https://arxiv.org/abs/2412.03572) | [Project Page](https://www.amirbar.net/nwm/) | [Notebook Demo](interactive_model.ipynb) | [Models](https://huggingface.co/facebook/nwm)
 
@@ -106,9 +112,14 @@ python train.py --config config/nwm_cdit_xl.yaml --ckpt-every 2000 --eval-every 
 Note: torch compile can lead to ~40%  faster training speed. However, it might lead to instabilities and inconsistent behvaior across different pytorch versions. Use carefuly.
 
 ## Pretrained Models
-To use a pretrained CDiT/XL model:
-- Download a pretrained model from [Hugging Face](https://huggingface.co/facebook/nwm)
-- Place the checkpoint in ./logs/nwm_cdit_xl/checkpoints
+Official CDiT/S, B, L, and XL checkpoints are available from
+[Hugging Face](https://huggingface.co/facebook/nwm). For the NavWare Phase A
+workflow, use CDiT/S with the repository key `CDiT-S/2` for development and
+match every larger model config to its own checkpoint. Never load an S/B
+checkpoint into an XL configuration.
+
+Place each checkpoint under the log directory selected by its experiment
+configuration.
 
 # Evaluation
 

@@ -1,5 +1,8 @@
 # Local WSL Setup
 
+This environment supports Phase A inference and evaluation. Phase A does not
+require WorldMem dependencies, `HybridCDiT` training, or a full NWM retrain.
+
 ## Verified reference environment
 
 The maintainer verified the following combination on 2026-08-02:
@@ -7,7 +10,7 @@ The maintainer verified the following combination on 2026-08-02:
 - Ubuntu 22.04 and Python 3.10;
 - PyTorch `2.4.1+cu124`;
 - an NVIDIA RTX 4060 visible from WSL;
-- doctor 17/17, the complete test suite, and a real CUDA tensor operation.
+- doctor 17/17, the repository tests, and a real CUDA tensor operation.
 
 This is a reference, not a required personal path layout. Windows and WSL must
 not share a virtual environment. A Windows venv contains Windows executables;
@@ -59,12 +62,19 @@ source .venv-wsl/bin/activate
 
 python scripts/navware.py doctor --profile nwm
 python scripts/navware.py smoke
+python -m pytest -q
 ```
 
 Use `--backend cpu` only on a machine without a visible NVIDIA GPU. On a GPU
 machine, run `nvidia-smi` first and select one of the backends supported by the
 setup script. The locally installed CUDA toolkit version does not select the
 PyTorch wheel; the driver and wheel compatibility do.
+
+The RTX 4060 is the primary CDiT/S development machine for environment checks,
+manifest construction, context-policy tests, and the small oracle gate. Begin
+with batch size one and mixed precision, then measure actual memory use. CDiT/B
+is optional locally. Reserve CDiT/XL confirmation for the cluster after the
+CDiT/S oracle and pose-aligned gates pass.
 
 After a successful installation, the wheel download cache may be removed:
 

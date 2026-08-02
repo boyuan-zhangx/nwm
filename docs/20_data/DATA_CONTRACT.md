@@ -19,11 +19,11 @@ Each `traj_data.pkl` must contain at least:
 
 The split path must contain `traj_names.txt` with one trajectory name per line.
 
-## Validate before training
+## Validate before any experiment
 
 ```bash
 export DATASET_ROOT=/path/to/dataset
-export SPLIT_PATH=data_splits/recon/train
+export SPLIT_PATH=data_splits/recon/test
 
 python scripts/validate_dataset.py \
   --data-root "$DATASET_ROOT" \
@@ -39,22 +39,30 @@ passes. Load pickle files only from trusted project datasets.
 Every benchmark record must preserve:
 
 - trajectory and query frame;
-- candidate memory frames;
+- candidate historical frames;
 - pose distance and wrapped heading difference;
 - temporal gap;
-- scenario or landmark identity;
+- scenario or landmark identity when annotated;
 - the labeling rule and its version.
 
-Define a correct memory before inspecting model outputs. A geometric candidate
-normally satisfies all of the following:
+Define a correct historical frame before inspecting model outputs. A geometric
+candidate normally satisfies all of the following:
 
-- its temporal gap exceeds the native context;
+- its temporal gap exceeds the native four-frame context;
 - its position distance is below a frozen threshold;
 - its wrapped yaw difference is below a frozen threshold;
-- it belongs to the same pre-annotated revisit event or landmark.
+- it belongs to the same pre-annotated revisit event or landmark when semantic
+  annotations are available.
 
-These independent labels support Recall@K and mAP. A model's own retrieval score
-must never become its ground truth.
+These independent labels support retrieval diagnostics. Phase A uses the first
+valid positive as a top-1 oracle candidate; a model's own retrieval score must
+never become its ground truth.
+
+Each query must also identify the ground-truth future frame used by the
+baseline evaluation path. The primary generation metrics compare the model
+prediction with that future frame, not with the historical frame selected as
+context. Historical-frame similarity is only an auxiliary, pose-matched
+consistency measure.
 
 ## Build the first geometric manifest
 
@@ -77,3 +85,13 @@ python scripts/build_revisit_manifest.py \
 `geometry_v1` provides pose/heading positives and geometric negatives only. For
 paper examples, freeze landmark and scenario annotations before viewing model
 results. Geometric proximity is not automatically task relevance.
+
+## Phase A sampling rules
+
+- Use only historical real observations from the same trajectory.
+- Require the historical index to lie outside the native four-frame context.
+- Select exactly one historical frame for replacement policies.
+- Clear history between trajectories and batch items.
+- Freeze revisit and non-revisit query lists before comparing model outputs.
+- Record the query index, selected source index, pose distance, wrapped yaw
+  difference, temporal gap, policy name, and seed for every prediction.

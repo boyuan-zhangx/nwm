@@ -9,8 +9,8 @@
 5. Copy `config/paths.example.yaml` to `config/paths.local.yaml` and edit only
    machine-specific paths.
 6. Run the dataset validator on the assigned split.
-7. Run a tiny baseline smoke before touching hybrid code or requesting a long
-   cluster job.
+7. Build or validate the assigned revisit manifest.
+8. Run a tiny frozen CDiT/S baseline before requesting a scaled cluster job.
 
 Stop and report the exact command and complete error when any gate fails. Do not
 work around a failed gate by editing source, removing a check, or changing data.
@@ -19,25 +19,49 @@ work around a failed gate by editing source, removing a check, or changing data.
 
 ### A. Data and benchmark
 
-Deliver a versioned revisit-event manifest, correct/wrong memory labels, and a
-dataset validation report. Freeze thresholds before inspecting model outputs.
+Deliver a versioned revisit-event manifest, oracle/random historical indices,
+ground-truth future indices, a non-revisit query list, and a dataset validation
+report. Freeze thresholds before inspecting model outputs.
 
-### B. Retrieval
+### B. Context-policy implementation
 
-Deliver Recall@K/mAP, top-k visualizations, and pose-only/action-only/combined/
-random comparisons. Modify only the retrieval module and config, and add tests.
+Implement a pure selector that consumes a query, real history, metadata, and a
+policy name, then returns exactly four source indices. Deliver unit tests for:
 
-### C. Training integration
+- `recent`, `random_history`, `oracle_manifest`, and `pose_aligned`;
+- deterministic random selection under a seed;
+- no current/future-frame leakage;
+- no cross-trajectory history;
+- identical shapes for all policies.
 
-Connect memory tensors, masks, and the freeze policy. Pass the tiny-overfit gate
-before any scale-up. Deliver loss curves, gradient statistics, fixed samples,
-and the complete YAML.
+Do not edit model architecture or training code for this work package.
 
-### D. Evaluation
+### C. Oracle gate
 
-Implement non-regression and revisit-only metrics. Every causal group must use
-the same directory schema, and aggregation code must read raw files rather than
-contain hand-entered numbers.
+Run `recent`, `random_history`, and `oracle_manifest` on 20-50 frozen revisit
+queries with official CDiT/S. Use matched diffusion seeds. Deliver raw
+predictions, selected indices, resolved config, metrics, and success and failure
+panels.
+
+Stop and report if oracle does not beat both controls. Do not proceed to learned
+retrieval or hybrid training.
+
+### D. Scale confirmation
+
+After the CDiT/S gate passes, repeat only the four frozen policies on CDiT/B and
+CDiT/XL. Change only the model configuration and matching checkpoint. Deliver a
+scale-by-policy table and report an S-only gain explicitly.
+
+### E. Evaluation
+
+Compare predictions with ground-truth future frames. Implement revisit and
+non-revisit metrics. Every policy must use the same directory schema, and
+aggregation code must read raw files rather than contain hand-entered numbers.
+
+### Deferred work: HybridCDiT
+
+Do not connect or train `HybridCDiT` unless the maintainer explicitly reopens
+Phase B after the oracle and pose-aligned gates pass.
 
 ## Required content for every pull request
 
@@ -53,8 +77,11 @@ contain hand-entered numbers.
 
 - hard-coding a personal path or interpreter;
 - selecting experiment groups inside Python source;
+- changing the model architecture or checkpoint for Phase A;
+- retrieving more than one historical frame in Phase A;
+- using generated predictions as Phase A history;
 - overwriting a source checkpoint or prior raw output;
-- reusing memory across trajectories;
+- reusing history across trajectories;
 - reporting only the best seed;
 - tuning ground-truth thresholds after viewing model results;
 - describing an unconnected or untested component as complete.

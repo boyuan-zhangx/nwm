@@ -1,5 +1,9 @@
 # Cluster Setup and Job Contract
 
+The cluster is a scaling tool for a Phase A experiment that already passed on
+CDiT/S. Do not allocate a long training job for context replacement: the
+current method freezes every NWM checkpoint and performs inference only.
+
 ## One-time installation
 
 ```bash
@@ -19,7 +23,7 @@ Run `nvidia-smi` before selecting a backend. Use `cu121` only when the cluster
 driver cannot support the repository's `cu124` wheel. Do not use an unpinned
 nightly PyTorch wheel from an old README.
 
-The LT-NWM path does not import the vendored `WorldMem/` package. Install that
+The Phase A path does not import the vendored `WorldMem/` package. Install that
 package only when reproducing the upstream WorldMem Minecraft baseline:
 
 ```bash
@@ -41,36 +45,28 @@ home directories, scratch roots, tokens, or host-specific mount points.
 
 ## Required metadata for every job
 
-Run these commands inside the job output directory:
-
-```bash
-git -C /path/to/nwm rev-parse HEAD > run_commit.txt
-python -m pip freeze > environment.txt
-nvidia-smi > nvidia_smi.txt
-cp "$EXPERIMENT_CONFIG" resolved_experiment.yaml
-cp "$PATHS_CONFIG" resolved_paths.yaml
-```
-
-Never commit tokens, W&B keys, or personal directories. Every run directory
-must contain at least:
+Every run directory must preserve:
 
 ```text
-checkpoints/
-logs/
+predictions/
 metrics/
 visualizations/
 metadata/
 ```
 
-## Gate before a long job
+Metadata must include the commit, resolved experiment and path configurations,
+environment snapshot, GPU information, checkpoint, query manifest, policies,
+and seeds. Never commit tokens, W&B keys, or personal directories.
 
-Set the paths once, then run all checks:
+## Gate before a scaled inference job
+
+Set the paths once, then run the general checks:
 
 ```bash
 export EXPERIMENT_CONFIG=config/nwm_cdit_xl.yaml
 export PATHS_CONFIG=config/paths.local.yaml
 export DATASET_ROOT=/path/to/dataset
-export SPLIT_FILE=data_splits/recon/train
+export SPLIT_FILE=data_splits/recon/test
 
 python scripts/navware.py doctor \
   --profile nwm \
@@ -83,14 +79,36 @@ python scripts/validate_dataset.py \
   --max-trajectories 20
 ```
 
-A hybrid job additionally requires a tiny-overfit loss curve, fixed samples,
-finite non-zero memory gradients, and an initial correct-vs-random comparison.
+Before requesting several GPUs or a long wall time, preserve local outputs that
+show all of the following:
 
-## Submit through Slurm
+1. the frozen baseline runs on a tiny revisit manifest;
+2. `oracle_manifest` beats `recent` and `random_history` on the primary metric;
+3. every policy emits exactly four conditioning frames;
+4. source frame indices and matched seeds are saved;
+5. no history crosses a trajectory boundary.
 
-`nwm.sh` is a site-neutral Slurm adapter. Do not edit it to insert a personal
-directory, partition, account, node name, or Conda installation. Pass
-site-specific scheduler values to `sbatch`:
+If the context-policy runner is not yet present, only baseline inference is
+executable. Do not substitute the hybrid configuration as a workaround.
+
+## Scale-up order
+
+1. Complete all debugging and ablations on official CDiT/S.
+2. Run the core four policies on CDiT/B with matched queries and seeds.
+3. Run the same core comparison on CDiT/XL only after S and B are interpretable.
+4. Do not spend cluster time on CDiT/L unless a specific result requires it.
+
+The core policies are `recent`, `random_history`, `oracle_manifest`, and
+`pose_aligned`. A larger checkpoint does not justify changing thresholds,
+queries, context construction, sampler steps, or metrics.
+
+## Upstream baseline training only
+
+`nwm.sh` is the site-neutral upstream training adapter. It is retained for
+baseline reproduction but is not the Phase A paper entry point. Do not edit it
+to insert a personal directory, partition, account, node name, or Conda
+installation. If baseline training is explicitly required, pass site-specific
+scheduler values to `sbatch`:
 
 ```bash
 export NAVWARE_VENV="$HOME/.venvs/navware-nwm"
@@ -107,6 +125,5 @@ sbatch \
   --bfloat16 1
 ```
 
-Add `--constraint`, `--nodelist`, or a different time limit on the `sbatch`
-command only when required by the site. The job adapter delegates preflight and
-training to `scripts/train.sh`, so local and cluster runs use the same contract.
+Add `--constraint`, `--nodelist`, or a different time limit only when required
+by the site. Do not use this training example for context replacement.

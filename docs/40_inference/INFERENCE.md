@@ -1,9 +1,30 @@
 # Inference
 
+## Current Phase A method
+
+The pretrained NWM accepts four conditioning frames. Context replacement must
+preserve that interface and all checkpoint weights:
+
+```text
+recent:              [t-3, t-2, t-1, t]
+random_history:      [random_old, t-2, t-1, t]
+pose_aligned:        [pose_match, t-2, t-1, t]
+oracle_manifest:     [oracle_match, t-2, t-1, t]
+```
+
+Exactly one real historical observation replaces the oldest native context
+frame. Do not append tokens, change positional embeddings, instantiate
+`HybridCDiT`, or retrieve top-k frames in Phase A.
+
+Use CDiT/S for implementation and the full policy matrix. Once the same runner
+is frozen, change only the model config and matching official checkpoint for
+CDiT/B and CDiT/XL confirmation. A scale change must not alter query selection,
+context indices, diffusion seeds, sampler steps, or metrics.
+
 ## Wrapper contract
 
-The inference wrapper accepts two required config files followed by unchanged
-`isolated_nwm_infer.py` arguments:
+The baseline inference wrapper accepts two required config files followed by
+unchanged `isolated_nwm_infer.py` arguments:
 
 ```text
 bash scripts/infer.sh EXPERIMENT_CONFIG PATHS_CONFIG [inference arguments...]
@@ -35,35 +56,39 @@ bash scripts/infer.sh \
 Use a new output directory for every commit/config/seed combination. Never
 overwrite the source checkpoint or a previous run's raw outputs.
 
-## Correct LT-NWM memory lifecycle
+## Implementation status
 
-The memory buffer must not update inside `HybridCDiT.forward`. The denoiser is
-called hundreds of times for one generated frame; updating there would treat
-diffusion steps as historical video frames.
+The baseline command above is executable. The four-policy context selector is
+the next implementation task and must not be documented as executed until its
+runner and tests land.
 
-Each rollout step must follow this order:
+Each query must follow this order:
 
-1. Query the buffer once using the current global pose and target action.
-2. Produce top-k VAE latents, source frame indices, retrieval scores, and mask.
-3. Reuse that exact memory set for every diffusion step of the generated frame.
-4. After decoding, write exactly one real observation or final predicted latent
-   to the buffer.
-5. Clear the buffer at the trajectory boundary. Never leak memory across batch
-   items or trajectories.
+1. Read the query and its past real observations from one trajectory.
+2. Select one source index according to the requested policy.
+3. Construct exactly four conditioning frames or latents.
+4. Reuse that exact context for every diffusion step of the prediction.
+5. Save the selected source index and retrieval diagnostics.
+6. Clear history at the trajectory boundary.
 
-## Required causal groups
+Do not update history inside a diffusion-model `forward` call. Do not add the
+decoded prediction to Phase A history; self-generated memory introduces drift
+and changes the research question.
 
-- `no_memory`
-- `correct_memory`
-- `random_memory`
-- `temporally_wrong_memory`
-- `heading_wrong_memory`
+## Required policy groups
 
-Every run must save the query, top-k source frames, source indices, each score
-component, memory mask, gate statistics, prediction, and seed. A qualitative
-video without those diagnostics cannot support a mechanism claim.
+- `recent`
+- `random_history`
+- `oracle_manifest`
+- `pose_aligned`
 
-The frozen group specification is
-`experiments/e04_memory_causal_ablation.yaml`. Its current status is
-`specification`. Change that status only after a runner consumes and validates
-every field.
+Run `recent`, `random_history`, and `oracle_manifest` first. Implement and run
+`pose_aligned` only if oracle passes the gate.
+
+Every run must save the query, selected source frame and index, pose distance,
+yaw difference, temporal gap, policy, prediction, ground-truth future, and
+seed. A qualitative video without those diagnostics cannot support a causal
+claim.
+
+The existing `experiments/e04_memory_causal_ablation.yaml` describes the older
+hybrid-memory study and is not the Phase A run configuration.
