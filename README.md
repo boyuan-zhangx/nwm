@@ -1,5 +1,7 @@
 ## Navigation World Models, CVPR 2025 (Oral) <br><sub>Official PyTorch Implementation</sub>
 
+> NavWare fork: LT-NWM research status, reproducible setup, training/inference handoff, and experiment gates are documented in [docs/README.md](docs/README.md). The hybrid memory branch is still under validation; read its status before launching cluster jobs.
+
 ### [Paper](https://arxiv.org/abs/2412.03572) | [Project Page](https://www.amirbar.net/nwm/) | [Notebook Demo](interactive_model.ipynb) | [Models](https://huggingface.co/facebook/nwm)
 
 This repo contains the official PyTorch implementation of Navigation World Models- the Conditional Diffusion Transformer (CDiT) model training code. See the [project page](https://www.amirbar.net/nwm) for additional results.
@@ -51,14 +53,28 @@ nwm/data
 ```  
 
 
-## Requirements:
+## Requirements
+
+The reproducible setup script selects the PyTorch backend explicitly and
+installs the pinned project dependency groups. For WSL with an NVIDIA GPU:
+
 ```bash
-mamba create -n nwm python=3.10
-mamba activate nwm
-pip3 install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu126
-mamba install ffmpeg
-pip3 install decord einops evo transformers diffusers tqdm timm notebook dreamsim torcheval lpips ipywidgets
+sudo apt update
+sudo apt install -y python3.10-venv ffmpeg
+
+mkdir -p ~/.venvs
+bash setup_nwm_env.sh \
+  --profile nwm \
+  --backend cu124 \
+  --venv ~/.venvs/navware-nwm
+
+ln -s ~/.venvs/navware-nwm .venv-wsl
+source .venv-wsl/bin/activate
+python scripts/navware.py doctor --profile nwm
 ```
+
+See [`docs/10_setup/LOCAL_WSL.md`](docs/10_setup/LOCAL_WSL.md) for disk
+layout, CPU-only setup, validation, and troubleshooting.
 
 ## Training
 

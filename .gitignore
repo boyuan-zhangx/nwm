@@ -1,4 +1,8 @@
 __pycache__
+.venv/
+.venv-wsl
+.uv-cache/
+config/paths.local.yaml
 results
 diffusion/__pycache__
 logs

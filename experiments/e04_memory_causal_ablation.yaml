@@ -1,0 +1,38 @@
+experiment_id: E04
+question: Does correct long-term memory causally improve revisit prediction?
+status: specification
+
+shared:
+  model_config: config/lt_nwm_tiny.yaml
+  paths_config: config/paths.local.yaml
+  revisit_manifest: artifacts/manifests/revisit_geometry_v1.jsonl
+  checkpoint: null
+  seeds: [0, 1, 2]
+  diffusion_steps: 250
+  top_k: 8
+
+groups:
+  - name: no_memory
+    retrieval_mode: disabled
+  - name: correct_memory
+    retrieval_mode: manifest_positive
+  - name: random_memory
+    retrieval_mode: manifest_random_wrong
+  - name: temporally_wrong_memory
+    retrieval_mode: manifest_temporally_wrong
+  - name: heading_wrong_memory
+    retrieval_mode: manifest_heading_wrong
+
+required_outputs:
+  - resolved_config.yaml
+  - run_metadata.json
+  - metrics.json
+  - retrieval.jsonl
+  - predictions/
+  - visualizations/
+
+acceptance:
+  primary_contrast: correct_memory_vs_random_memory
+  require_all_seeds: true
+  require_non_regression_metrics: true
+  forbid_best_seed_only_reporting: true

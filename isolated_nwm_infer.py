@@ -3,7 +3,7 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
-#from distributed import init_distributed
+from distributed import init_distributed
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -18,6 +18,7 @@ from diffusers.models import AutoencoderKL
 
 import misc
 import distributed as dist
+from config_utils import load_config
 from models import CDiT_models
 from datasets import EvalDataset
 from PIL import Image
@@ -144,13 +145,7 @@ def main(args):
 
     os.makedirs(args.save_output_dir, exist_ok=True)
 
-    with open("config/eval_config.yaml", "r") as f:
-        default_config = yaml.safe_load(f)
-    config = default_config
-
-    with open(exp_eval, "r") as f:
-        user_config = yaml.safe_load(f)
-    config.update(user_config)
+    config = load_config("config/eval_config.yaml", exp_eval, args.paths_config)
 
     latent_size = config['image_size'] // 8
     args.latent_size = config['image_size'] // 8
@@ -224,6 +219,12 @@ if __name__ == "__main__":
     
     parser.add_argument("--output_dir", type=str, default=None, help="output directory")
     parser.add_argument("--exp", type=str, default=None, help="experiment name")
+    parser.add_argument(
+        "--paths-config",
+        type=str,
+        default=None,
+        help="optional machine-specific YAML overlay for data/results paths",
+    )
     parser.add_argument("--ckp", type=str, default='0100000')
     parser.add_argument("--num_sec_eval", type=int, default=5)
     parser.add_argument("--input_fps", type=int, default=4)

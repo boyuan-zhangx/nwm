@@ -1,400 +1,415 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# Hybrid CDiT model integrating WorldMem memory mechanisms
-# 
-# This implementation combines:
-# - CDiT's precise conditional guidance through cross-attention
-# - WorldMem's long-term memory capabilities through selective memory access
-# --------------------------------------------------------
+"""Long-term-memory extension for Navigation World Models.
+
+The memory lifecycle intentionally lives outside the diffusion model. A diffusion
+sampler calls the denoiser hundreds of times for one output frame; mutating a
+buffer inside ``forward`` would therefore store denoising steps instead of video
+frames. Callers retrieve memory once per predicted frame and pass the selected
+VAE latents to :class:`HybridCDiT` through ``memory_latents``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
-import numpy as np
-import math
-from typing import Optional, Union, List
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
-from models import TimestepEmbedder, ActionEmbedder, modulate, FinalLayer
+from timm.models.vision_transformer import Attention, Mlp, PatchEmbed
+
+from models import ActionEmbedder, FinalLayer, TimestepEmbedder, modulate
+
+
+@dataclass(frozen=True)
+class RetrievalResult:
+    """Frames and diagnostics returned by a memory query."""
+
+    frames: torch.Tensor
+    frame_indices: torch.Tensor
+    scores: torch.Tensor
 
 
 class MemoryBuffer:
+    """Trajectory-local FIFO memory with pose/action-aware retrieval.
+
+    Frames are stored as VAE latents on CPU. The buffer is deliberately not an
+    ``nn.Module`` and is never checkpointed as model state. Create one buffer per
+    rollout (or per sample) to avoid information leaking between trajectories.
     """
-    Efficient memory buffer for storing and retrieving historical frames
-    with action-based behavioral similarity selection.
-    """
-    def __init__(self, max_size: int = 100, similarity_threshold: float = 0.7):
+
+    def __init__(
+        self,
+        max_size: int = 100,
+        *,
+        spatial_weight: float = 0.4,
+        action_weight: float = 0.35,
+        storage_weight: float = 0.2,
+        usage_weight: float = 0.05,
+        spatial_scale: float = 10.0,
+    ) -> None:
+        if max_size < 1:
+            raise ValueError("max_size must be positive")
+        weights = spatial_weight + action_weight + storage_weight + usage_weight
+        if not math.isclose(weights, 1.0, abs_tol=1e-6):
+            raise ValueError(f"retrieval weights must sum to 1.0, got {weights}")
+        if spatial_scale <= 0:
+            raise ValueError("spatial_scale must be positive")
+
         self.max_size = max_size
-        self.similarity_threshold = similarity_threshold
-        self.frames = []
-        self.poses = []
-        self.actions = []  # Store actions for behavioral similarity
-        self.frame_indices = []
-        
-    def add_frame(self, frame_latent: torch.Tensor, pose: torch.Tensor, action: torch.Tensor = None, frame_idx: int = 0):
-        """Add a new frame to memory buffer with associated action - 保存到CPU以减少GPU内存使用"""
-        # 推理时才使用buffer，所以保存到CPU是合理的，使用时会转移到GPU
-        self.frames.append(frame_latent.detach().cpu())
-        self.poses.append(pose.detach().cpu())
-        if action is not None:
-            self.actions.append(action.detach().cpu())
-        else:
-            # Placeholder if no action provided
-            if len(self.actions) > 0:
-                self.actions.append(torch.zeros_like(self.actions[0]))
-            else:
-                self.actions.append(torch.zeros(3))  # Default [delta_x, delta_y, delta_yaw]
-        self.frame_indices.append(frame_idx)
-        
-        # Maintain buffer size
-        if len(self.frames) > self.max_size:
-            self.frames.pop(0)
-            self.poses.pop(0)
-            self.actions.pop(0)
-            self.frame_indices.pop(0)
-    
-    def get_relevant_frames(self, current_pose: torch.Tensor, target_action: torch.Tensor = None, k: int = 8) -> Optional[torch.Tensor]:
-        """
-        Retrieve k most relevant frames based on spatial proximity and action intent
-        Focus on behavioral relevance rather than pose similarity
-        """
-        if len(self.frames) == 0:
+        self.spatial_weight = spatial_weight
+        self.action_weight = action_weight
+        self.storage_weight = storage_weight
+        self.usage_weight = usage_weight
+        self.spatial_scale = spatial_scale
+        self.frames: list[torch.Tensor] = []
+        self.poses: list[torch.Tensor] = []
+        self.actions: list[torch.Tensor] = []
+        self.frame_indices: list[int] = []
+        self.storage_scores: list[float] = []
+        self.usage_counts: list[int] = []
+
+    def __len__(self) -> int:
+        return len(self.frames)
+
+    def clear(self) -> None:
+        self.frames.clear()
+        self.poses.clear()
+        self.actions.clear()
+        self.frame_indices.clear()
+        self.storage_scores.clear()
+        self.usage_counts.clear()
+
+    def add_frame(
+        self,
+        frame_latent: torch.Tensor,
+        pose: torch.Tensor,
+        action: Optional[torch.Tensor] = None,
+        frame_idx: int = 0,
+        storage_score: float = 1.0,
+    ) -> None:
+        """Store one ``[C,H,W]`` VAE latent and its retrieval metadata."""
+
+        if frame_latent.ndim != 3:
+            raise ValueError(
+                f"frame_latent must have shape [C,H,W], got {tuple(frame_latent.shape)}"
+            )
+        if pose.ndim != 1 or pose.numel() < 2:
+            raise ValueError(f"pose must be a 1-D vector with x/y, got {tuple(pose.shape)}")
+        if action is None:
+            action = torch.zeros(3, dtype=pose.dtype, device=pose.device)
+        if action.ndim != 1 or action.numel() != 3:
+            raise ValueError(f"action must have shape [3], got {tuple(action.shape)}")
+
+        self.frames.append(frame_latent.detach().to(device="cpu"))
+        self.poses.append(pose.detach().to(device="cpu"))
+        self.actions.append(action.detach().to(device="cpu"))
+        self.frame_indices.append(int(frame_idx))
+        self.storage_scores.append(float(max(0.0, min(storage_score, 1.0))))
+        self.usage_counts.append(0)
+
+        if len(self) > self.max_size:
+            for values in (
+                self.frames,
+                self.poses,
+                self.actions,
+                self.frame_indices,
+                self.storage_scores,
+                self.usage_counts,
+            ):
+                values.pop(0)
+
+    def query(
+        self,
+        current_pose: torch.Tensor,
+        target_action: Optional[torch.Tensor] = None,
+        *,
+        k: int = 8,
+        update_usage: bool = True,
+    ) -> Optional[RetrievalResult]:
+        """Return the top-k memories and the exact scores used to select them."""
+
+        if len(self) == 0:
             return None
-            
-        if len(self.frames) <= k:
-            return torch.stack(self.frames).to(current_pose.device)
-        
-        # Vectorized similarity computation for efficiency - 纯GPU操作
-        current_pos = current_pose[:3]  # 保持GPU，移除.cpu()
-        memory_poses = torch.stack(self.poses).to(current_pose.device)  # 确保在同一设备
-        
-        # 1. Spatial distance computation (primary factor)
-        if current_pose.shape[0] >= 2:  # At least x, y available
-            pose_dims = min(3, memory_poses.shape[1])  # Use up to 3 dimensions
-            spatial_dists = torch.norm(memory_poses[:, :pose_dims] - current_pos[:pose_dims], dim=1)
-            spatial_sims = torch.exp(-spatial_dists / 10.0)
+        if k < 1:
+            raise ValueError("k must be positive")
+        if current_pose.ndim != 1 or current_pose.numel() < 2:
+            raise ValueError("current_pose must be a 1-D vector containing x/y")
+
+        device = current_pose.device
+        poses = torch.stack(self.poses).to(device=device, dtype=current_pose.dtype)
+        pose_dims = min(current_pose.numel(), poses.shape[1], 3)
+        spatial_distance = torch.linalg.vector_norm(
+            poses[:, :pose_dims] - current_pose[:pose_dims], dim=1
+        )
+        spatial_similarity = torch.exp(-spatial_distance / self.spatial_scale)
+
+        if target_action is None:
+            action_similarity = torch.zeros_like(spatial_similarity)
         else:
-            spatial_sims = torch.ones(len(self.poses), device=current_pose.device)
-        
-        # 2. Action-based similarity (if target action provided)
-        # Focus on BEHAVIORAL CATEGORIES rather than exact action matching
-        if target_action is not None and hasattr(self, 'actions') and len(self.actions) > 0:
-            target_action_gpu = target_action.to(current_pose.device)  # 保持GPU
-            memory_actions = torch.stack(self.actions).to(current_pose.device)  # 确保在GPU
-            
-            # Behavioral similarity based on movement categories
-            action_sims = self._compute_behavioral_similarity(target_action_gpu, memory_actions)
-            
-            # Combined similarity: prioritize spatial proximity, consider action patterns
-            similarities = 0.8 * spatial_sims + 0.2 * action_sims
-        else:
-            # Fall back to spatial similarity only
-            similarities = spatial_sims
-        
-        # Select top-k (single operation, no loop)
-        top_k_indices = torch.topk(similarities, min(k, len(similarities))).indices
-        relevant_frames = [self.frames[i] for i in top_k_indices]
-        return torch.stack(relevant_frames).to(current_pose.device)
-    
-    def _compute_behavioral_similarity(self, target_action: torch.Tensor, memory_actions: torch.Tensor) -> torch.Tensor:
-        """
-        计算基于行为语义的相似性，而不是简单的数值距离
-        考虑转弯的方向性和运动模式的分类
-        
-        Args:
-            target_action: [delta_x, delta_y, delta_yaw] 目标动作
-            memory_actions: [N, 3] 历史动作集合
-            
-        Returns:
-            torch.Tensor: [N] 行为相似性分数
-        """
-        # 提取运动组件
-        target_linear = target_action[:2]  # [delta_x, delta_y]
-        target_yaw = target_action[2]      # delta_yaw
-        
-        memory_linear = memory_actions[:, :2]  # [N, 2]
-        memory_yaw = memory_actions[:, 2]      # [N]
-        
-        # 1. 线性运动相似性 (位移向量)
-        target_linear_norm = torch.norm(target_linear)
-        memory_linear_norm = torch.norm(memory_linear, dim=1)
-        
-        # 运动幅度相似性
-        magnitude_sims = torch.exp(-torch.abs(target_linear_norm - memory_linear_norm) / 2.0)
-        
-        # 运动方向相似性 (仅对非零运动计算)
-        direction_sims = torch.ones_like(magnitude_sims)
-        if target_linear_norm > 0.1:  # 有明显线性运动
-            target_direction = target_linear / target_linear_norm
-            valid_memory = memory_linear_norm > 0.1
-            if valid_memory.any():
-                memory_directions = memory_linear[valid_memory] / memory_linear_norm[valid_memory].unsqueeze(1)
-                dot_products = torch.mm(memory_directions, target_direction.unsqueeze(1)).squeeze()
-                direction_sims[valid_memory] = (dot_products + 1) / 2  # 从[-1,1]映射到[0,1]
-        
-        # 2. 旋转行为分类相似性
-        yaw_sims = self._compute_rotation_similarity(target_yaw, memory_yaw)
-        
-        # 3. 综合行为相似性
-        # 权重：线性运动(40%) + 方向(30%) + 旋转行为(30%)
-        behavioral_sims = 0.4 * magnitude_sims + 0.3 * direction_sims + 0.3 * yaw_sims
-        
-        return behavioral_sims
-    
-    def _compute_rotation_similarity(self, target_yaw: torch.Tensor, memory_yaw: torch.Tensor) -> torch.Tensor:
-        """
-        基于旋转行为语义的相似性计算 - 转弯和直行有不同评分标准
-        确保转弯动作的相似性分数明显低于直行，避免混淆
-        
-        行为分类：
-        - 直行: |yaw| < 0.1 rad (~6°) -> 高相似性基线 (0.9-1.0)
-        - 微调: 0.1 <= |yaw| < 0.3 rad (~6°-17°) -> 中等相似性 (0.6-0.8)
-        - 转弯: 0.3 <= |yaw| < 1.0 rad (~17°-57°) -> 低相似性 (0.3-0.6)
-        - 大转: |yaw| >= 1.0 rad (~57°+) -> 最低相似性 (0.1-0.4)
-        """
-        device = target_yaw.device
-        
-        # 旋转方向分类
-        target_direction = torch.sign(target_yaw)  # -1, 0, 1
-        memory_direction = torch.sign(memory_yaw)   # [N]
-        
-        # 旋转幅度分类
-        def categorize_rotation(yaw_abs):
-            """将旋转幅度分类"""
-            return torch.where(yaw_abs < 0.1, 0,      # 直行
-                   torch.where(yaw_abs < 0.3, 1,      # 微调  
-                   torch.where(yaw_abs < 1.0, 2, 3))) # 转弯 / 大转
-        
+            actions = torch.stack(self.actions).to(device=device, dtype=target_action.dtype)
+            action_similarity = self._compute_behavioral_similarity(target_action, actions)
+
+        storage = torch.tensor(self.storage_scores, device=device, dtype=spatial_similarity.dtype)
+        usage = torch.tensor(self.usage_counts, device=device, dtype=spatial_similarity.dtype)
+        usage = torch.clamp(torch.log1p(usage) / 5.0, max=1.0)
+        scores = (
+            self.spatial_weight * spatial_similarity
+            + self.action_weight * action_similarity
+            + self.storage_weight * storage
+            + self.usage_weight * usage
+        )
+
+        count = min(k, len(self))
+        top = torch.topk(scores, count, sorted=True).indices
+        host_indices = top.detach().cpu().tolist()
+        if update_usage:
+            for index in host_indices:
+                self.usage_counts[index] += 1
+
+        frames = torch.stack([self.frames[index] for index in host_indices]).to(device)
+        frame_indices = torch.tensor(
+            [self.frame_indices[index] for index in host_indices], device=device, dtype=torch.long
+        )
+        return RetrievalResult(frames=frames, frame_indices=frame_indices, scores=scores[top])
+
+    def get_relevant_frames(
+        self,
+        current_pose: torch.Tensor,
+        target_action: Optional[torch.Tensor] = None,
+        k: int = 8,
+    ) -> Optional[torch.Tensor]:
+        """Compatibility helper returning only the selected frame latents."""
+
+        result = self.query(current_pose, target_action, k=k)
+        return None if result is None else result.frames
+
+    @staticmethod
+    def _compute_behavioral_similarity(
+        target_action: torch.Tensor, memory_actions: torch.Tensor
+    ) -> torch.Tensor:
+        if target_action.ndim != 1 or target_action.numel() != 3:
+            raise ValueError("target_action must have shape [3]")
+        if memory_actions.ndim != 2 or memory_actions.shape[1] != 3:
+            raise ValueError("memory_actions must have shape [M,3]")
+
+        target_linear = target_action[:2]
+        memory_linear = memory_actions[:, :2]
+        target_norm = torch.linalg.vector_norm(target_linear)
+        memory_norm = torch.linalg.vector_norm(memory_linear, dim=1)
+        magnitude = torch.exp(-torch.abs(target_norm - memory_norm) / 2.0)
+
+        direction = torch.ones_like(magnitude)
+        if bool(target_norm > 0.1):
+            valid = memory_norm > 0.1
+            if bool(valid.any()):
+                target_unit = target_linear / target_norm
+                memory_unit = memory_linear[valid] / memory_norm[valid, None]
+                direction[valid] = (memory_unit @ target_unit + 1.0) / 2.0
+
+        yaw = MemoryBuffer._compute_rotation_similarity(
+            target_action[2], memory_actions[:, 2]
+        )
+        return 0.4 * magnitude + 0.3 * direction + 0.3 * yaw
+
+    @staticmethod
+    def _compute_rotation_similarity(
+        target_yaw: torch.Tensor, memory_yaw: torch.Tensor
+    ) -> torch.Tensor:
+        def category(values: torch.Tensor) -> torch.Tensor:
+            return torch.where(
+                values < 0.1,
+                0,
+                torch.where(values < 0.3, 1, torch.where(values < 1.0, 2, 3)),
+            )
+
         target_abs = torch.abs(target_yaw)
         memory_abs = torch.abs(memory_yaw)
-        
-        target_category = categorize_rotation(target_abs)
-        memory_categories = categorize_rotation(memory_abs)
-        
-        # 计算相似性 - 不同行为类别有不同的评分基准
-        direction_match = (target_direction == memory_direction).float()
-        category_match = (target_category == memory_categories).float()
-        
-        # 初始化相似性分数
-        yaw_sims = torch.zeros_like(memory_yaw, device=device)
-        
-        # 分类别处理，确保转弯和直行有明显的评分差异
-        
-        # 1. 直行类别（目标为直行）
-        if target_category == 0:
-            # 直行时，优先选择其他直行动作
-            straight_mask = (memory_categories == 0)
-            yaw_sims[straight_mask] = 1.0  # 直行间完全匹配
-            
-            # 对微调给予较低分数
-            minor_adjust_mask = (memory_categories == 1)
-            yaw_sims[minor_adjust_mask] = 0.3
-            
-            # 对转弯给予很低分数
-            turn_mask = (memory_categories >= 2)
-            yaw_sims[turn_mask] = 0.1
-            
-        # 2. 转弯类别（目标为转弯）
-        else:
-            # 完美匹配：同方向同类别
-            perfect_match = (direction_match == 1) & (category_match == 1)
-            # 根据类别设定不同的基础分数，转弯类别的基础分数较低
-            base_scores = torch.tensor([0.9, 0.7, 0.5, 0.3], device=device)  # 直行, 微调, 转弯, 大转
-            yaw_sims[perfect_match] = base_scores[target_category]
-            
-            # 同方向不同类别：给予中等分数
-            direction_only = (direction_match == 1) & (category_match == 0)
-            if direction_only.any():
-                # 基于角度差异的衰减
-                yaw_diff = torch.abs(target_abs - memory_abs[direction_only])
-                angle_similarity = torch.exp(-yaw_diff / 0.5)
-                # 应用类别惩罚
-                category_penalty = base_scores[target_category] * 0.7
-                yaw_sims[direction_only] = angle_similarity * category_penalty
-            
-            # 方向相反：极低分数
-            opposite_direction = (direction_match == 0) & (target_category > 0) & (memory_categories > 0)
-            yaw_sims[opposite_direction] = 0.05
-            
-            # 转弯时遇到直行：低分数
-            turning_vs_straight = (target_category > 0) & (memory_categories == 0)
-            yaw_sims[turning_vs_straight] = 0.1
-        
-        return yaw_sims
+        target_category = category(target_abs)
+        memory_category = category(memory_abs)
+        direction_match = torch.sign(target_yaw) == torch.sign(memory_yaw)
+        category_match = target_category == memory_category
+
+        scores = torch.zeros_like(memory_yaw)
+        if int(target_category.item()) == 0:
+            scores[memory_category == 0] = 1.0
+            scores[memory_category == 1] = 0.3
+            scores[memory_category >= 2] = 0.1
+            return scores
+
+        base_scores = memory_yaw.new_tensor([0.9, 0.7, 0.5, 0.3])
+        base = base_scores[target_category]
+        perfect = direction_match & category_match
+        scores[perfect] = base
+
+        direction_only = direction_match & ~category_match
+        scores[direction_only] = (
+            torch.exp(-torch.abs(target_abs - memory_abs[direction_only]) / 0.5) * base * 0.7
+        )
+        scores[(~direction_match) & (memory_category > 0)] = 0.05
+        scores[(target_category > 0) & (memory_category == 0)] = 0.1
+        return scores
 
 
 class SelectiveMemoryAttention(nn.Module):
-    """
-    Selective memory attention module that can be optionally activated
-    """
-    def __init__(self, hidden_size: int, num_heads: int = 16):
+    """Cross-attention from current CDiT tokens to retrieved memory tokens."""
+
+    def __init__(self, hidden_size: int, num_heads: int) -> None:
         super().__init__()
-        self.hidden_size = hidden_size
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
-        
-        # Memory query/key/value projections
         self.to_q = nn.Linear(hidden_size, hidden_size, bias=False)
         self.to_k = nn.Linear(hidden_size, hidden_size, bias=False)
         self.to_v = nn.Linear(hidden_size, hidden_size, bias=False)
         self.to_out = nn.Linear(hidden_size, hidden_size)
-        
-        # Gating mechanism for optional activation
-        self.activation_gate = nn.Parameter(torch.zeros(1))
-        self.relevance_threshold = 0.1
-        
-    def compute_relevance(self, query: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-        """Compute relevance scores between query and memory"""
-        # Simplified relevance: cosine similarity
-        query_norm = torch.nn.functional.normalize(query, dim=-1)
-        memory_norm = torch.nn.functional.normalize(memory, dim=-1)
-        relevance = torch.sum(query_norm.unsqueeze(1) * memory_norm, dim=-1)
-        return relevance
-    
-    def forward(self, x: torch.Tensor, memory_frames: Optional[torch.Tensor] = None, 
-                activate_memory: bool = True) -> torch.Tensor:
-        """
-        Forward pass with optional memory activation
-        
-        Args:
-            x: Current frame features [B, N, D]
-            memory_frames: Memory buffer frames [B, M, N, D] 
-            activate_memory: Whether to activate memory mechanism
-        """
-        if not activate_memory or memory_frames is None:
-            return x * 0  # Return zero if memory not activated
-        
-        B, N, D = x.shape
-        _, M, _, _ = memory_frames.shape
-        
-        # Reshape memory for attention
-        memory_flat = memory_frames.view(B, M * N, D)
-        
-        # Compute relevance and filter irrelevant memory
-        relevance = self.compute_relevance(x.mean(dim=1, keepdim=True), memory_flat.mean(dim=1, keepdim=True))
-        
-        if relevance.max() < self.relevance_threshold:
-            return x * 0  # Skip memory if not relevant enough
-        
-        # Multi-head attention computation
-        q = self.to_q(x).view(B, N, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.to_k(memory_flat).view(B, M * N, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.to_v(memory_flat).view(B, M * N, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Scaled dot-product attention
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn_weights = torch.softmax(attn_weights, dim=-1)
-        
-        # Apply attention
-        out = torch.matmul(attn_weights, v)
-        out = out.transpose(1, 2).contiguous().view(B, N, D)
-        out = self.to_out(out)
-        
-        # Apply activation gate (learnable parameter)
-        return out * torch.sigmoid(self.activation_gate)
+
+    def forward(
+        self,
+        query_tokens: torch.Tensor,
+        memory_tokens: torch.Tensor,
+        memory_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if query_tokens.ndim != 3:
+            raise ValueError("query_tokens must have shape [B,N,D]")
+        if memory_tokens.ndim != 4:
+            raise ValueError("memory_tokens must have shape [B,M,N,D]")
+
+        batch, query_count, hidden = query_tokens.shape
+        memory_batch, memory_count, token_count, memory_hidden = memory_tokens.shape
+        if (memory_batch, memory_hidden) != (batch, hidden):
+            raise ValueError("memory/query batch and hidden dimensions must match")
+
+        flattened = memory_tokens.reshape(batch, memory_count * token_count, hidden)
+        query = self.to_q(query_tokens).reshape(
+            batch, query_count, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key = self.to_k(flattened).reshape(
+            batch, memory_count * token_count, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        value = self.to_v(flattened).reshape(
+            batch, memory_count * token_count, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+
+        logits = query @ key.transpose(-2, -1) / math.sqrt(self.head_dim)
+        if memory_mask is not None:
+            if memory_mask.shape != (batch, memory_count):
+                raise ValueError("memory_mask must have shape [B,M]")
+            token_mask = memory_mask[:, :, None].expand(-1, -1, token_count).reshape(batch, -1)
+            logits = logits.masked_fill(~token_mask[:, None, None, :], -torch.inf)
+            all_masked = ~token_mask.any(dim=1)
+            if bool(all_masked.any()):
+                logits[all_masked] = 0
+
+        attention = torch.softmax(logits, dim=-1)
+        output = attention @ value
+        output = output.transpose(1, 2).reshape(batch, query_count, hidden)
+        output = self.to_out(output)
+        if memory_mask is not None:
+            output = output * memory_mask.any(dim=1)[:, None, None]
+        return output
 
 
 class HybridCDiTBlock(nn.Module):
-    """
-    Hybrid CDiT block that combines:
-    1. CDiT's self-attention and cross-attention for precise conditional control
-    2. Selective memory attention for long-term consistency
-    """
-    def __init__(self, hidden_size: int, num_heads: int, mlp_ratio: float = 4.0, 
-                 enable_memory: bool = True, **block_kwargs):
+    """Checkpoint-compatible CDiT block with a zero-initialized memory branch."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        *,
+        enable_memory: bool = True,
+        **block_kwargs,
+    ) -> None:
         super().__init__()
         self.enable_memory = enable_memory
-        
-        # CDiT core components (unchanged)
+
+        # Keep baseline module names and shapes unchanged for checkpoint loading.
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.norm_cond = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.cttn = nn.MultiheadAttention(hidden_size, num_heads=num_heads, 
-                                         add_bias_kv=True, bias=True, batch_first=True, **block_kwargs)
-        
-        # Memory components (new)
+        self.cttn = nn.MultiheadAttention(
+            hidden_size,
+            num_heads=num_heads,
+            add_bias_kv=True,
+            bias=True,
+            batch_first=True,
+            **block_kwargs,
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 11 * hidden_size, bias=True)
+        )
+        self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden_dim,
+            act_layer=lambda: nn.GELU(approximate="tanh"),
+            drop=0,
+        )
+
         if enable_memory:
             self.memory_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
             self.memory_attn = SelectiveMemoryAttention(hidden_size, num_heads)
-        
-        # MLP
-        self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        
-        # AdaLN modulation (extended for memory)
-        num_modulations = 14 if enable_memory else 11
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, num_modulations * hidden_size, bias=True)
-        )
-    
-    def forward(self, x: torch.Tensor, c: torch.Tensor, x_cond: torch.Tensor, 
-                memory_frames: Optional[torch.Tensor] = None, 
-                memory_activation_score: float = 0.0):
-        """
-        Forward pass with optional memory integration
-        
-        Args:
-            x: Input features [B, N, D]
-            c: Conditioning signal [B, D] 
-            x_cond: Context frames [B, context_size, N, D]
-            memory_frames: Memory buffer [B, M, N, D]
-            memory_activation_score: Score determining memory activation strength
-        """
-        if self.enable_memory:
-            modulations = self.adaLN_modulation(c).chunk(14, dim=1)
-            (shift_msa, scale_msa, gate_msa, 
-             shift_ca_xcond, scale_ca_xcond, shift_ca_x, scale_ca_x, gate_ca_x,
-             shift_mem, scale_mem, gate_mem,
-             shift_mlp, scale_mlp, gate_mlp) = modulations
-        else:
-            modulations = self.adaLN_modulation(c).chunk(11, dim=1)
-            (shift_msa, scale_msa, gate_msa, 
-             shift_ca_xcond, scale_ca_xcond, shift_ca_x, scale_ca_x, gate_ca_x,
-             shift_mlp, scale_mlp, gate_mlp) = modulations
-        
-        # 1. Self-attention (CDiT standard)
-        x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa)
-        )
-        
-        # 2. Cross-attention with immediate context (CDiT core strength)
-        x_cond_norm = modulate(self.norm_cond(x_cond.flatten(1, 2)), shift_ca_xcond, scale_ca_xcond)
-        x = x + gate_ca_x.unsqueeze(1) * self.cttn(
-            query=modulate(self.norm2(x), shift_ca_x, scale_ca_x), 
-            key=x_cond_norm, 
-            value=x_cond_norm, 
-            need_weights=False
+            self.memory_adaLN = nn.Sequential(
+                nn.SiLU(), nn.Linear(hidden_size, 3 * hidden_size, bias=True)
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        x_cond: torch.Tensor,
+        memory_tokens: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+        memory_activation: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        (
+            shift_msa,
+            scale_msa,
+            gate_msa,
+            shift_ca_xcond,
+            scale_ca_xcond,
+            shift_ca_x,
+            scale_ca_x,
+            gate_ca_x,
+            shift_mlp,
+            scale_mlp,
+            gate_mlp,
+        ) = self.adaLN_modulation(c).chunk(11, dim=1)
+        x = x + gate_msa[:, None] * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x_cond_norm = modulate(self.norm_cond(x_cond), shift_ca_xcond, scale_ca_xcond)
+        x = x + gate_ca_x[:, None] * self.cttn(
+            query=modulate(self.norm2(x), shift_ca_x, scale_ca_x),
+            key=x_cond_norm,
+            value=x_cond_norm,
+            need_weights=False,
         )[0]
-        
-        # 3. Selective memory attention (WorldMem enhancement)
-        if self.enable_memory and memory_frames is not None:
-            # Adaptive memory activation based on relevance score
-            activate_memory = memory_activation_score > 0.3  # Threshold for activation
-            
+
+        if self.enable_memory and memory_tokens is not None:
+            shift_mem, scale_mem, gate_mem = self.memory_adaLN(c).chunk(3, dim=1)
             memory_output = self.memory_attn(
                 modulate(self.memory_norm(x), shift_mem, scale_mem),
-                memory_frames=memory_frames,
-                activate_memory=activate_memory
+                memory_tokens,
+                memory_mask,
             )
-            x = x + gate_mem.unsqueeze(1) * memory_output
-        
-        # 4. MLP
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(
-            modulate(self.norm3(x), shift_mlp, scale_mlp)
-        )
-        
+            if memory_activation is not None:
+                gate_mem = gate_mem * memory_activation.reshape(-1, 1)
+            x = x + gate_mem[:, None] * memory_output
+
+        x = x + gate_mlp[:, None] * self.mlp(modulate(self.norm3(x), shift_mlp, scale_mlp))
         return x
 
 
 class HybridCDiT(nn.Module):
-    """
-    Hybrid CDiT model combining precise conditional control with selective long-term memory
-    """
+    """CDiT with explicit, externally retrieved long-term-memory latents."""
+
     def __init__(
         self,
         input_size: int = 32,
-        context_size: int = 4,  # Will be 4 for XL, 3 for L/B
+        context_size: int = 4,
         patch_size: int = 2,
         in_channels: int = 4,
         hidden_size: int = 1152,
@@ -403,9 +418,9 @@ class HybridCDiT(nn.Module):
         mlp_ratio: float = 4.0,
         learn_sigma: bool = True,
         memory_enabled: bool = True,
-        memory_layers: Optional[List[int]] = None,
-        memory_buffer_size: int = 50
-    ):
+        memory_layers: Optional[Sequence[int]] = None,
+        **_: object,
+    ) -> None:
         super().__init__()
         self.context_size = context_size
         self.learn_sigma = learn_sigma
@@ -414,217 +429,148 @@ class HybridCDiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.memory_enabled = memory_enabled
-        
-        # Default memory layers (activate in later layers)
+
         if memory_layers is None:
-            memory_layers = list(range(depth // 2, depth))  # Second half of layers
-        self.memory_layers = set(memory_layers)
-        
-        # Core CDiT components
+            memory_layers = range(depth // 2, depth)
+        invalid_layers = sorted(set(memory_layers) - set(range(depth)))
+        if invalid_layers:
+            raise ValueError(f"memory_layers outside model depth: {invalid_layers}")
+        self.memory_layers = frozenset(memory_layers)
+
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = ActionEmbedder(hidden_size)
         self.time_embedder = TimestepEmbedder(hidden_size)
-        
-        # Positional embeddings
         num_patches = self.x_embedder.num_patches
         self.pos_embed = nn.Parameter(
-            torch.zeros(self.context_size + 1, num_patches, hidden_size), 
-            requires_grad=True
+            torch.zeros(context_size + 1, num_patches, hidden_size), requires_grad=True
         )
-        
-        # Transformer blocks (hybrid)
-        self.blocks = nn.ModuleList()
-        for i in range(depth):
-            enable_memory_layer = memory_enabled and (i in self.memory_layers)
-            self.blocks.append(
-                HybridCDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, 
-                              enable_memory=enable_memory_layer)
-            )
-        
+        self.blocks = nn.ModuleList(
+            [
+                HybridCDiTBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    enable_memory=memory_enabled and index in self.memory_layers,
+                )
+                for index in range(depth)
+            ]
+        )
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
-        
-        # Memory management
-        self.memory_buffer = MemoryBuffer(max_size=memory_buffer_size) if memory_enabled else None
-        self.frame_counter = 0
-        
         self.initialize_weights()
-    
-    def initialize_weights(self):
-        """Initialize model weights (same as CDiT)"""
-        def _basic_init(module):
+
+    def initialize_weights(self) -> None:
+        def initialize(module: nn.Module) -> None:
             if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
+                nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
-        self.apply(_basic_init)
-        
-        # Initialize positional embeddings
+
+        self.apply(initialize)
         nn.init.normal_(self.pos_embed, std=0.02)
-        
-        # Initialize patch embedding
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+        weight = self.x_embedder.proj.weight.data
+        nn.init.xavier_uniform_(weight.view(weight.shape[0], -1))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
-        
-        # Initialize embedders
-        for embedder in [self.y_embedder.x_emb, self.y_embedder.y_emb, self.y_embedder.angle_emb, 
-                        self.t_embedder, self.time_embedder]:
+        for embedder in (
+            self.y_embedder.x_emb,
+            self.y_embedder.y_emb,
+            self.y_embedder.angle_emb,
+            self.t_embedder,
+            self.time_embedder,
+        ):
             nn.init.normal_(embedder.mlp[0].weight, std=0.02)
             nn.init.normal_(embedder.mlp[2].weight, std=0.02)
-        
-        # Zero-out adaLN modulation layers
+
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        
-        # Zero-out output layers
+            if block.enable_memory:
+                # The hybrid is exactly the baseline at initialization.
+                nn.init.constant_(block.memory_adaLN[-1].weight, 0)
+                nn.init.constant_(block.memory_adaLN[-1].bias, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
-    
-    def update_memory(self, frame_latent: torch.Tensor, pose: torch.Tensor, action: torch.Tensor = None):
-        """Update memory buffer with new frame and associated action"""
-        if self.memory_buffer is not None:
-            self.memory_buffer.add_frame(frame_latent, pose, action, self.frame_counter)
-            self.frame_counter += 1
-    
-    def compute_memory_activation_score(self, current_pose: torch.Tensor, 
-                                       action_magnitude: float) -> float:
-        """
-        Compute a score that determines when to activate memory
-        Higher scores indicate more need for memory consultation
-        """
-        # Activate memory more when:
-        # 1. Large camera movements (might revisit areas)
-        # 2. Low action magnitude (might be looking around)
-        # 3. When memory buffer has sufficient content
-        
-        movement_score = min(action_magnitude / 5.0, 1.0)  # Normalize action magnitude
-        buffer_score = len(self.memory_buffer.frames) / self.memory_buffer.max_size if self.memory_buffer else 0
-        
-        # Combination heuristic (can be learned)
-        activation_score = 0.3 * (1 - movement_score) + 0.7 * buffer_score
-        return activation_score
-    
-    def unpatchify(self, x):
-        """Unpatchify as in original CDiT"""
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
 
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
-    
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor, 
-                x_cond: torch.Tensor, rel_t: torch.Tensor, 
-                current_pose: Optional[torch.Tensor] = None,
-                update_memory: bool = True):
-        """
-        Forward pass with optional memory integration
-        
-        Args:
-            x: Input tensor [N, C, H, W]
-            t: Timestep [N]
-            y: Action conditions [N, 3]  
-            x_cond: Context frames [N, context_size, C, H, W]
-            rel_t: Relative time [N]
-            current_pose: Current camera pose [N, 4] (x,y,z,yaw) - no pitch in dataset
-            update_memory: Whether to update memory buffer
-        """
-        # Embed inputs (same as CDiT)
-        x = self.x_embedder(x) + self.pos_embed[self.context_size:]
-        x_cond = self.x_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1])) + self.pos_embed[:self.context_size]
-        
-        # Conditioning
-        t_emb = self.t_embedder(t[..., None])
-        y_emb = self.y_embedder(y)
-        time_emb = self.time_embedder(rel_t[..., None])
-        c = t_emb + time_emb + y_emb
-        
-        # Memory preparation - 只在推理时使用，训练时跳过
-        memory_frames = None
-        memory_activation_score = 0.0
-        
-        # 只在推理阶段（非训练模式）使用内存buffer
-        if self.memory_enabled and current_pose is not None and not self.training:
-            # Get relevant memory frames based on intended action (behavioral similarity)
-            target_action = y[0] if y is not None else None  # Current target action
-            memory_frames = self.memory_buffer.get_relevant_frames(
-                current_pose[0], target_action=target_action, k=8
+    def encode_memory_latents(self, memory_latents: torch.Tensor) -> torch.Tensor:
+        if memory_latents.ndim != 5:
+            raise ValueError("memory_latents must have shape [B,M,C,H,W]")
+        batch, memories = memory_latents.shape[:2]
+        tokens = self.x_embedder(memory_latents.flatten(0, 1))
+        tokens = tokens + self.pos_embed[self.context_size]
+        return tokens.unflatten(0, (batch, memories))
+
+    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
+        channels = self.out_channels
+        patch = self.x_embedder.patch_size[0]
+        height = width = int(x.shape[1] ** 0.5)
+        if height * width != x.shape[1]:
+            raise ValueError("token count must form a square grid")
+        x = x.reshape(x.shape[0], height, width, patch, patch, channels)
+        x = torch.einsum("nhwpqc->nchpwq", x)
+        return x.reshape(x.shape[0], channels, height * patch, height * patch)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        x_cond: torch.Tensor,
+        rel_t: torch.Tensor,
+        memory_latents: Optional[torch.Tensor] = None,
+        memory_mask: Optional[torch.Tensor] = None,
+        memory_activation: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = self.x_embedder(x) + self.pos_embed[self.context_size]
+        x_cond = self.x_embedder(x_cond.flatten(0, 1)).unflatten(
+            0, (x_cond.shape[0], x_cond.shape[1])
+        )
+        x_cond = x_cond + self.pos_embed[: self.context_size]
+        x_cond = x_cond.flatten(1, 2)
+
+        conditioning = (
+            self.t_embedder(t[..., None])
+            + self.y_embedder(y)
+            + self.time_embedder(rel_t[..., None])
+        )
+        memory_tokens = None
+        if memory_latents is not None:
+            if not self.memory_enabled:
+                raise ValueError("memory_latents supplied to a memory-disabled model")
+            memory_tokens = self.encode_memory_latents(memory_latents)
+
+        for block in self.blocks:
+            x = block(
+                x,
+                conditioning,
+                x_cond,
+                memory_tokens,
+                memory_mask,
+                memory_activation,
             )
-            if memory_frames is not None:
-                # memory_frames shape: [k, C, H, W], 需要扩展为 [batch_size, k, C, H, W]
-                if memory_frames.dim() == 4:  # [k, C, H, W]
-                    memory_frames = memory_frames.unsqueeze(0).expand(x.shape[0], -1, -1, -1, -1)
-                elif memory_frames.dim() == 3:  # [k, H, W] 单通道情况
-                    memory_frames = memory_frames.unsqueeze(0).unsqueeze(2).expand(x.shape[0], -1, x.shape[1], -1, -1)
-            
-            # Compute memory activation score
-            action_magnitude = torch.norm(y[0]).item()
-            memory_activation_score = self.compute_memory_activation_score(current_pose[0], action_magnitude)
-        
-        # Transformer blocks with selective memory
-        for i, block in enumerate(self.blocks):
-            if i in self.memory_layers:
-                x = block(x, c, x_cond, memory_frames, memory_activation_score)
-            else:
-                x = block(x, c, x_cond)  # Standard CDiT processing
-        
-        # Final processing
-        x = self.final_layer(x, c)
-        x = self.unpatchify(x)
-        
-        # Update memory 只在推理时更新，训练时跳过
-        if update_memory and self.memory_enabled and current_pose is not None and not self.training:
-            current_action = y[0] if y is not None else None  # Store the action that led to this frame
-            self.update_memory(x.detach(), current_pose[0], current_action)
-        
-        return x
+        return self.unpatchify(self.final_layer(x, conditioning))
 
 
-# Model configurations
-def HybridCDiT_XL_2(**kwargs):
-    return HybridCDiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, 
-                     context_size=4, **kwargs)
+def HybridCDiT_XL_2(**kwargs: object) -> HybridCDiT:
+    return HybridCDiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
-def HybridCDiT_L_2(**kwargs):
-    return HybridCDiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, 
-                     context_size=3, **kwargs)
 
-def HybridCDiT_B_2(**kwargs):
-    return HybridCDiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, 
-                     context_size=3, **kwargs)
+def HybridCDiT_L_2(**kwargs: object) -> HybridCDiT:
+    return HybridCDiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
 
-def HybridCDiT_S_2(**kwargs):
-    return HybridCDiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, 
-                     context_size=3, **kwargs)
+
+def HybridCDiT_B_2(**kwargs: object) -> HybridCDiT:
+    return HybridCDiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+
+
+def HybridCDiT_S_2(**kwargs: object) -> HybridCDiT:
+    return HybridCDiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+
 
 HybridCDiT_models = {
-    'HybridCDiT-XL/2': HybridCDiT_XL_2,
-    'HybridCDiT-L/2': HybridCDiT_L_2, 
-    'HybridCDiT-B/2': HybridCDiT_B_2,
-    'HybridCDiT-S/2': HybridCDiT_S_2
+    "HybridCDiT-XL/2": HybridCDiT_XL_2,
+    "HybridCDiT-L/2": HybridCDiT_L_2,
+    "HybridCDiT-B/2": HybridCDiT_B_2,
+    "HybridCDiT-S/2": HybridCDiT_S_2,
 }
-
-if __name__ == "__main__":
-    # Test the hybrid model
-    model = HybridCDiT_L_2(memory_enabled=True)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # Test forward pass
-    batch_size = 2
-    x = torch.randn(batch_size, 4, 32, 32)
-    t = torch.randint(0, 1000, (batch_size,))
-    y = torch.randn(batch_size, 3)
-    x_cond = torch.randn(batch_size, 3, 4, 32, 32)  # context_size=3 for L model
-    rel_t = torch.randn(batch_size)
-    current_pose = torch.randn(batch_size, 4)  # [x, y, z, yaw] - no pitch
-    
-    with torch.no_grad():
-        output = model(x, t, y, x_cond, rel_t, current_pose)
-        print(f"Output shape: {output.shape}")

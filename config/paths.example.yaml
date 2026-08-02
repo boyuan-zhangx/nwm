@@ -1,0 +1,25 @@
+# Copy this file outside Git (for example config/paths.local.yaml) and edit paths.
+# No Python source change is needed. Environment variables are expanded.
+results_dir: ${NAVWARE_RESULTS_ROOT}/logs
+
+datasets:
+  recon:
+    data_folder: ${NAVWARE_DATA_ROOT}/recon
+  tartan_drive:
+    data_folder: ${NAVWARE_DATA_ROOT}/tartan
+  sacson:
+    data_folder: ${NAVWARE_DATA_ROOT}/sacson
+  scand:
+    data_folder: ${NAVWARE_DATA_ROOT}/scand
+
+eval_datasets:
+  recon:
+    data_folder: ${NAVWARE_DATA_ROOT}/recon
+  tartan_drive:
+    data_folder: ${NAVWARE_DATA_ROOT}/tartan
+  sacson:
+    data_folder: ${NAVWARE_DATA_ROOT}/sacson
+  scand:
+    data_folder: ${NAVWARE_DATA_ROOT}/scand
+  go_stanford:
+    data_folder: ${NAVWARE_DATA_ROOT}/go_stanford

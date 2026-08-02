@@ -25,6 +25,7 @@ import os
 import matplotlib.pyplot as plt 
 import yaml
 
+from config_utils import load_config
 
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -103,13 +104,7 @@ def main(args):
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
-    with open("config/eval_config.yaml", "r") as f:
-        default_config = yaml.safe_load(f)
-    config = default_config
-    
-    with open(args.config, "r") as f:
-        user_config = yaml.safe_load(f)
-    config.update(user_config)
+    config = load_config("config/eval_config.yaml", args.config, args.paths_config)
     
     # Setup an experiment folder:
     os.makedirs(config['results_dir'], exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -422,6 +417,12 @@ def evaluate(model, vae, diffusion, test_dataloaders, rank, batch_size, num_work
 def get_args_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument(
+        "--paths-config",
+        type=str,
+        default=None,
+        help="optional machine-specific YAML overlay for data/results paths",
+    )
     parser.add_argument("--epochs", type=int, default=300)
     # parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)

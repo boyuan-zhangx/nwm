@@ -1,58 +1,159 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Reproducible Python 3.10 environment for local Linux/WSL and GPU clusters.
 
-################################################################################
-# Usage Instructions:
-# This script is intended to create and configure a Conda environment 
-# tailored for the NWM project (Python 3.10).
-#
-# - Please ensure that conda and Mamba is installed on your system.
-# - The script will automatically create a Conda environment named "nwm-env" 
-#   and install all required dependencies then activate it
-#
-# Usage (run in terminal on Linux or via WSL2 on Windows):
-# 1. Save this file as setup_nwm_env.sh
-# 2. Grant execution permission: chmod +x setup_nwm_env.sh
-# 3. Execute the script: ./setup_nwm_env.sh  or bash setup_nwm_env.sh
-#
-# ⚠️ Note: This script installs the PyTorch nightly build with CUDA 12.6 support.
-################################################################################
+set -euo pipefail
 
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ENV_DIR="${REPO_ROOT}/.venv-wsl"
+PYTHON_BIN="python3.10"
+PROFILE="nwm"
+TORCH_BACKEND="cpu"
+DRY_RUN=0
 
-#Stop after any error
-set -e
+usage() {
+  cat <<'EOF'
+Usage: ./setup_nwm_env.sh [options]
 
-echo "Step 1: Create new conda environment (nwm-env, Python 3.10)"
-mamba create -y -n nwm-env python=3.10
+Options:
+  --profile core|nwm|worldmem|all  Dependency group (default: nwm)
+  --backend cpu|cu121|cu124        PyTorch wheel backend (default: cpu)
+  --python COMMAND                 Python 3.10 executable (default: python3.10)
+  --venv PATH                     Virtual environment path (default: .venv-wsl)
+  --dry-run                       Print the resolved setup without installing
+  -h, --help                      Show this help
 
-echo "Step 2: Activate the environment"
-source "$(conda info --base)/etc/profile.d/conda.sh"
-eval "$(mamba shell hook --shell bash)"
-mamba activate nwm-env
+Examples:
+  ./setup_nwm_env.sh --profile nwm --backend cpu
+  ./setup_nwm_env.sh --profile all --backend cu124
+EOF
+}
 
-echo "Step 3: Install PyTorch, torchvision, torchaudio with CUDA 12.6 using pip"
-pip3 install pyyaml typeguard --pre torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/nightly/cu126
+while (($#)); do
+  case "$1" in
+    --profile)
+      PROFILE="$2"
+      shift 2
+      ;;
+    --backend)
+      TORCH_BACKEND="$2"
+      shift 2
+      ;;
+    --python)
+      PYTHON_BIN="$2"
+      shift 2
+      ;;
+    --venv)
+      ENV_DIR="$2"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
-echo "Step 4: Install core scientific libraries using pip"
-pip3 install numpy scipy pandas matplotlib scikit-learn 
+case "${PROFILE}" in
+  core|nwm|worldmem|all) ;;
+  *)
+    echo "Unsupported profile: ${PROFILE}" >&2
+    exit 2
+    ;;
+esac
 
-echo "Step 5: Install IPython and JupyterLab using pip"
-pip3 install ipython jupyterlab
+case "${TORCH_BACKEND}" in
+  cpu|cu121|cu124) ;;
+  *)
+    echo "Unsupported PyTorch backend: ${TORCH_BACKEND}" >&2
+    exit 2
+    ;;
+esac
 
-echo "Step 6: Install world model project libraries (einops, transformers) using pip"
-pip3 install einops transformers
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+  echo "Python command not found: ${PYTHON_BIN}" >&2
+  echo "Install Python 3.10 in the WSL distribution/cluster, then rerun." >&2
+  exit 1
+fi
 
-echo "Step 7: Install additional pip-only libraries"
-pip3 install decord diffusers tqdm timm torcheval lpips notebook dreamsim ipywidgets ffmpeg
+PYTHON_VERSION="$(${PYTHON_BIN} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+if [[ "${PYTHON_VERSION}" != "3.10" ]]; then
+  echo "Expected Python 3.10, found ${PYTHON_VERSION} via ${PYTHON_BIN}." >&2
+  exit 1
+fi
 
-echo "Step 8: Install additional conda libraries" ffmpegfor video processing
-conda install -c conda-forge ffmpeg
+if ! "${PYTHON_BIN}" -c 'import ensurepip' >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+Python 3.10 is installed, but ensurepip/venv support is missing.
+On Ubuntu 22.04 run:
 
-echo "Step 9: make you bashrc eval every time to use (de)activate "
-mamba shell init --shell bash --root-prefix=~/.local/share/mamba
+  sudo apt update
+  sudo apt install -y python3.10-venv
 
-echo "✅ Environment 'nwm-env' setup complete. You can now activate it in new bash using:"
-echo "   mamba activate nwm-env"
-eval "$(mamba shell hook --shell bash)"
-mamba activate nwm-env
+Then rerun this setup script. Windows and WSL environments are intentionally
+separate: WSL uses .venv-wsl; the Windows CPU test environment may use .venv.
+EOF
+  exit 1
+fi
 
+if [[ -e "${ENV_DIR}" && ! -x "${ENV_DIR}/bin/python" ]]; then
+  echo "Incomplete or non-Linux environment found at: ${ENV_DIR}" >&2
+  echo "Choose a new --venv path or remove that environment directory, then rerun." >&2
+  exit 1
+fi
 
+echo "Repository: ${REPO_ROOT}"
+echo "Environment: ${ENV_DIR}"
+echo "Profile: ${PROFILE}"
+echo "PyTorch backend: ${TORCH_BACKEND}"
+
+if ((DRY_RUN)); then
+  exit 0
+fi
+
+if [[ ! -x "${ENV_DIR}/bin/python" ]]; then
+  "${PYTHON_BIN}" -m venv "${ENV_DIR}"
+fi
+VENV_PYTHON="${ENV_DIR}/bin/python"
+"${VENV_PYTHON}" -m pip install --upgrade "pip>=24,<26" wheel setuptools
+
+TORCH_INDEX_URL="https://download.pytorch.org/whl/${TORCH_BACKEND}"
+"${VENV_PYTHON}" -m pip install \
+  torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 \
+  --index-url "${TORCH_INDEX_URL}"
+
+"${VENV_PYTHON}" -m pip install -r "${REPO_ROOT}/requirements/dev.txt"
+
+if [[ "${PROFILE}" == "nwm" || "${PROFILE}" == "all" ]]; then
+  "${VENV_PYTHON}" -m pip install -r "${REPO_ROOT}/requirements/nwm.txt"
+fi
+
+if [[ "${PROFILE}" == "worldmem" || "${PROFILE}" == "all" ]]; then
+  "${VENV_PYTHON}" -m pip install -r "${REPO_ROOT}/WorldMem/requirements.txt"
+fi
+
+"${VENV_PYTHON}" -m pip check
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "Warning: ffmpeg is missing. Install it with the OS/cluster package manager." >&2
+fi
+
+DOCTOR_PROFILE="core"
+if [[ "${PROFILE}" == "nwm" || "${PROFILE}" == "all" ]]; then
+  DOCTOR_PROFILE="nwm"
+elif [[ "${PROFILE}" == "worldmem" ]]; then
+  DOCTOR_PROFILE="worldmem"
+fi
+
+"${VENV_PYTHON}" "${REPO_ROOT}/scripts/navware.py" doctor --profile "${DOCTOR_PROFILE}"
+"${VENV_PYTHON}" "${REPO_ROOT}/scripts/navware.py" smoke
+
+echo "Environment ready. Activate with: source '${ENV_DIR}/bin/activate'"

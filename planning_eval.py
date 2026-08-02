@@ -10,6 +10,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 import argparse
 import yaml
+from config_utils import load_config
 import os
 import numpy as np
 import lpips
@@ -141,13 +142,9 @@ class WM_Planning_Evaluator:
         self.exp_eval = self.exp
         self.get_eval_name()
 
-        with open("config/eval_config.yaml", "r") as f:
-            default_config = yaml.safe_load(f)
-        self.config = default_config
-
-        with open(self.exp_eval, "r") as f:
-            user_config = yaml.safe_load(f)
-        self.config.update(user_config)
+        self.config = load_config(
+            "config/eval_config.yaml", self.exp_eval, args.paths_config
+        )
 
         latent_size = self.config['image_size'] // 8
         self.latent_size = self.config['image_size'] // 8
@@ -417,6 +414,12 @@ if __name__ == "__main__":
     
     # Default Args
     parser.add_argument("--exp", type=str, default=None, help="experiment name")
+    parser.add_argument(
+        "--paths-config",
+        type=str,
+        default=None,
+        help="optional machine-specific YAML overlay for data/results paths",
+    )
     parser.add_argument("--ckp", type=str, default='0100000', help="experiment name")
 
     parser.add_argument("--datasets", type=str, default=None, help="dataset name")
